@@ -157,6 +157,7 @@ impl Default for Header {
 /// assert!(SdoId::try_from(0x1000).is_err());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct SdoId(u16);
 
 impl core::fmt::Display for SdoId {
@@ -172,6 +173,50 @@ impl SdoId {
 
     const fn low_byte(self) -> u8 {
         self.0 as u8
+    }
+}
+
+#[cfg(feature = "serde")]
+struct SdoIdVisitor;
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for SdoId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_newtype_struct("SdoId", SdoIdVisitor)
+    }
+}
+
+#[cfg(all(feature = "serde", feature = "std"))]
+impl<'de> serde::de::Visitor<'de> for SdoIdVisitor {
+    type Value = SdoId;
+
+    fn expecting(&self, formatter: &mut core::fmt::Formatter) -> core::fmt::Result {
+        formatter.write_str("a 12 bit value within the 0..=0xFFF range")
+    }
+
+    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::{de::Error, Deserialize};
+        let v = u16::deserialize(deserializer)?;
+        SdoId::try_from(v).or(Err(D::Error::custom(std::format!(
+            "SdoId not in range of 0..=0xFFF: {}",
+            v
+        ))))
+    }
+
+    fn visit_u16<E>(self, v: u16) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        SdoId::try_from(v).or(Err(E::custom(std::format!(
+            "SdoId not in range of 0..=0xFFF: {}",
+            v
+        ))))
     }
 }
 
@@ -369,9 +414,21 @@ mod tests {
 
     #[test]
     fn sdo_id_checks() {
-        let sdo_id = SdoId::try_from(0xfff).unwrap();
-        assert_eq!(0xfff, u16::from(sdo_id));
+        use serde_test::{assert_de_tokens_error, assert_tokens, Token};
+        let correct_sdo_id = SdoId::try_from(0xfff).unwrap();
+        let faulty_sdo_id = SdoId::try_from(0x1000);
 
-        assert!(SdoId::try_from(0x1000).is_err());
+        assert_eq!(0xfff, u16::from(correct_sdo_id));
+        assert!(faulty_sdo_id.is_err());
+
+        assert_tokens(
+            &correct_sdo_id,
+            &[Token::NewtypeStruct { name: "SdoId" }, Token::U16(4095)],
+        );
+
+        assert_de_tokens_error::<SdoId>(
+            &[Token::NewtypeStruct { name: "SdoId" }, Token::U16(4096)],
+            "SdoId not in range of 0..=0xFFF: 4096",
+        );
     }
 }

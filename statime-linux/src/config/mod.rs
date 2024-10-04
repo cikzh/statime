@@ -3,7 +3,6 @@ use std::{
     net::SocketAddr,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
 use log::warn;
@@ -14,14 +13,13 @@ use statime::{
 };
 use timestamped_socket::interface::InterfaceName;
 
+use crate::tracing::LogLevel;
+
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Config {
-    #[serde(
-        default = "default_loglevel",
-        deserialize_with = "deserialize_loglevel"
-    )]
-    pub loglevel: log::LevelFilter,
+    #[serde(default)]
+    pub loglevel: LogLevel,
     #[serde(default = "default_sdo_id")]
     pub sdo_id: u16,
     #[serde(default = "default_domain")]
@@ -32,10 +30,14 @@ pub struct Config {
     pub priority1: u8,
     #[serde(default = "default_priority2")]
     pub priority2: u8,
+    #[serde(default)]
+    pub path_trace: bool,
     #[serde(rename = "port")]
     pub ports: Vec<PortConfig>,
     #[serde(default)]
     pub observability: ObservabilityConfig,
+    #[serde(default)]
+    pub virtual_system_clock: bool,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -45,7 +47,7 @@ pub struct PortConfig {
     #[serde(default, deserialize_with = "deserialize_acceptable_master_list")]
     pub acceptable_master_list: Option<Vec<ClockIdentity>>,
     #[serde(default)]
-    pub hardware_clock: Option<PathBuf>,
+    pub hardware_clock: Option<u32>,
     #[serde(default)]
     pub network_mode: NetworkMode,
     #[serde(default = "default_announce_interval")]
@@ -58,18 +60,10 @@ pub struct PortConfig {
     pub master_only: bool,
     #[serde(default = "default_delay_asymmetry")]
     pub delay_asymmetry: i64,
-    #[serde(default = "default_delay_mechanism")]
-    pub delay_mechanism: i8,
-}
-
-fn deserialize_loglevel<'de, D>(deserializer: D) -> Result<log::LevelFilter, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    use serde::de::Error;
-    let raw: String = Deserialize::deserialize(deserializer)?;
-    log::LevelFilter::from_str(&raw)
-        .map_err(|e| D::Error::custom(format!("Invalid loglevel: {}", e)))
+    #[serde(default)]
+    pub delay_mechanism: DelayType,
+    #[serde(default = "default_delay_interval")]
+    pub delay_interval: i8,
 }
 
 fn deserialize_acceptable_master_list<'de, D>(
@@ -114,8 +108,13 @@ impl From<PortConfig> for statime::config::PortConfig<Option<Vec<ClockIdentity>>
             announce_receipt_timeout: pc.announce_receipt_timeout,
             master_only: pc.master_only,
             delay_asymmetry: Duration::from_nanos(pc.delay_asymmetry),
-            delay_mechanism: DelayMechanism::E2E {
-                interval: Interval::from_log_2(pc.delay_mechanism),
+            delay_mechanism: match pc.delay_mechanism {
+                DelayType::E2E => DelayMechanism::E2E {
+                    interval: Interval::from_log_2(pc.delay_interval),
+                },
+                DelayType::P2P => DelayMechanism::P2P {
+                    interval: Interval::from_log_2(pc.delay_interval),
+                },
             },
         }
     }
@@ -130,10 +129,18 @@ pub enum NetworkMode {
     Ethernet,
 }
 
+#[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum DelayType {
+    #[default]
+    E2E,
+    P2P,
+}
+
 impl Config {
     /// Parse config from file
     pub fn from_file(file: &Path) -> Result<Config, ConfigError> {
-        let meta = std::fs::metadata(file).unwrap();
+        let meta = std::fs::metadata(file).map_err(ConfigError::Io)?;
         let perm = meta.permissions();
 
         if perm.mode() as libc::mode_t & libc::S_IWOTH != 0 {
@@ -175,10 +182,6 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-fn default_loglevel() -> log::LevelFilter {
-    log::LevelFilter::Info
-}
-
 fn default_domain() -> u8 {
     0
 }
@@ -211,18 +214,13 @@ fn default_delay_asymmetry() -> i64 {
     0
 }
 
-fn default_delay_mechanism() -> i8 {
+fn default_delay_interval() -> i8 {
     0
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct ObservabilityConfig {
-    #[serde(
-        default = "default_loglevel",
-        deserialize_with = "deserialize_loglevel"
-    )]
-    pub loglevel: log::LevelFilter,
     #[serde(default)]
     pub observation_path: Option<PathBuf>,
     #[serde(default = "default_observation_permissions")]
@@ -234,16 +232,11 @@ pub struct ObservabilityConfig {
 impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
-            loglevel: default_observability_loglevel(),
             observation_path: Default::default(),
             observation_permissions: default_observation_permissions(),
             metrics_exporter_listen: default_metrics_exporter_listen(),
         }
     }
-}
-
-const fn default_observability_loglevel() -> log::LevelFilter {
-    log::LevelFilter::Info
 }
 
 const fn default_observation_permissions() -> u32 {
@@ -260,7 +253,7 @@ mod tests {
 
     use timestamped_socket::interface::InterfaceName;
 
-    use crate::config::ObservabilityConfig;
+    use crate::{config::ObservabilityConfig, tracing::LogLevel};
 
     // Minimal amount of config results in default values
     #[test]
@@ -280,18 +273,21 @@ interface = "enp0s31f6"
             announce_receipt_timeout: 3,
             master_only: false,
             delay_asymmetry: 0,
-            delay_mechanism: 0,
+            delay_mechanism: crate::config::DelayType::E2E,
+            delay_interval: 0,
         };
 
         let expected = crate::config::Config {
-            loglevel: log::LevelFilter::Info,
+            loglevel: LogLevel::Info,
             sdo_id: 0x000,
             domain: 0,
             identity: None,
             priority1: 128,
             priority2: 128,
+            path_trace: false,
             ports: vec![expected_port],
             observability: ObservabilityConfig::default(),
+            virtual_system_clock: false,
         };
 
         let actual = toml::from_str(MINIMAL_CONFIG).unwrap();

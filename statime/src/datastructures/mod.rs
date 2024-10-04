@@ -30,9 +30,6 @@ impl core::fmt::Display for WireFormatError {
 #[cfg(feature = "std")]
 impl std::error::Error for WireFormatError {}
 
-#[cfg(feature = "error_in_core")]
-impl core::error::Error for WireFormatError {}
-
 impl From<arrayvec::CapacityError> for WireFormatError {
     fn from(_: arrayvec::CapacityError) -> Self {
         WireFormatError::CapacityError
@@ -46,9 +43,6 @@ impl From<EnumConversionError> for WireFormatError {
 }
 
 trait WireFormat: Debug + Clone + Eq {
-    /// The byte size on the wire of this object
-    fn wire_size(&self) -> usize;
-
     /// Serializes the object into the PTP wire format.
     ///
     /// Returns the used buffer size that contains the message or an error.

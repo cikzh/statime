@@ -10,7 +10,7 @@ use super::{
 use crate::{
     datastructures::{
         common::{PortIdentity, TimeInterval},
-        datasets::DefaultDS,
+        datasets::InternalDefaultDS,
         messages::{AnnounceMessage, Header},
     },
     port::state::PortState,
@@ -93,25 +93,24 @@ impl<A> Bmca<A> {
     /// - `own_data`: Called 'D0' by the PTP spec. The DefaultDS data of our own
     ///   ptp instance.
     /// - `best_global_announce_message`: Called 'Ebest' by the PTP spec. This
-    ///   is the best announce message and the
-    /// identity of the port that received it of all of the best port announce
-    /// messages.
+    ///   is the best announce message and the identity of the port that
+    ///   received it of all of the best port announce messages.
     /// - `best_port_announce_message`: Called 'Erbest' by the PTP spec. This is
-    ///   the best announce message and the
-    /// identity of the port that received it of the port we are calculating the
-    /// recommended state for.
+    ///   the best announce message and the identity of the port that received
+    ///   it of the port we are calculating the recommended state for.
     /// - `port_state`: The current state of the port we are doing the
     ///   calculation for.
     ///
     /// If None is returned, then the port should remain in the same state as it
     /// is now.
-    pub(crate) fn calculate_recommended_state<F>(
-        own_data: &DefaultDS,
+    pub(crate) fn calculate_recommended_state(
+        own_data: &InternalDefaultDS,
         best_global_announce_message: Option<BestAnnounceMessage>,
         best_port_announce_message: Option<BestAnnounceMessage>,
-        port_state: &PortState<F>,
+        port_state: &PortState,
     ) -> Option<RecommendedState> {
-        if best_global_announce_message.is_none() && matches!(port_state, PortState::Listening) {
+        // We stick to the 1588-2008, assuming the change in 1588-2019 is in error
+        if best_port_announce_message.is_none() && matches!(port_state, PortState::Listening) {
             None
         } else if (1..=127).contains(&own_data.clock_quality.clock_class) {
             // only consider the best message of the port
@@ -130,7 +129,7 @@ impl<A> Bmca<A> {
     }
 
     fn calculate_recommended_state_low_class(
-        own_data: &DefaultDS,
+        own_data: &InternalDefaultDS,
         best_port_announce_message: Option<BestAnnounceMessage>,
     ) -> RecommendedState {
         let d0 = ComparisonDataset::from_own_data(own_data);
@@ -143,7 +142,7 @@ impl<A> Bmca<A> {
     }
 
     fn calculate_recommended_state_high_class(
-        own_data: &DefaultDS,
+        own_data: &InternalDefaultDS,
         best_global_announce_message: Option<BestAnnounceMessage>,
         best_port_announce_message: Option<BestAnnounceMessage>,
     ) -> RecommendedState {
@@ -287,8 +286,8 @@ impl BestAnnounceMessage {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RecommendedState {
-    M1(DefaultDS),
-    M2(DefaultDS),
+    M1(InternalDefaultDS),
+    M2(InternalDefaultDS),
     M3(AnnounceMessage),
     P1(AnnounceMessage),
     P2(AnnounceMessage),
@@ -379,6 +378,52 @@ mod tests {
     }
 
     #[test]
+    fn test_master_registration_rollover() {
+        let mut bmca = Bmca::new(
+            AcceptAnyMaster,
+            TimeInterval(100.into()),
+            PortIdentity::default(),
+        );
+        let mut announce = default_announce_message();
+        announce.header.source_port_identity.clock_identity.0 = [1, 2, 3, 4, 5, 6, 7, 8];
+        announce.header.sequence_id = u16::MAX - 2;
+        bmca.register_announce_message(&announce.header, &announce);
+        assert!(bmca.take_best_port_announce_message().is_none());
+        bmca.step_age(TimeInterval(100.into()).into());
+        announce.header.sequence_id = u16::MAX - 1;
+        bmca.register_announce_message(&announce.header, &announce);
+        assert!(bmca.take_best_port_announce_message().is_some());
+        bmca.step_age(TimeInterval(100.into()).into());
+        announce.header.sequence_id = u16::MAX;
+        bmca.register_announce_message(&announce.header, &announce);
+        assert!(bmca.take_best_port_announce_message().is_some());
+        bmca.step_age(TimeInterval(100.into()).into());
+        announce.header.sequence_id = 0;
+        bmca.register_announce_message(&announce.header, &announce);
+        assert!(bmca.take_best_port_announce_message().is_some());
+        bmca.step_age(TimeInterval(100.into()).into());
+        announce.header.sequence_id = 1;
+        bmca.register_announce_message(&announce.header, &announce);
+        assert!(bmca.take_best_port_announce_message().is_some());
+        bmca.step_age(TimeInterval(100.into()).into());
+        announce.header.sequence_id = 2;
+        bmca.register_announce_message(&announce.header, &announce);
+        assert!(bmca.take_best_port_announce_message().is_some());
+        bmca.step_age(TimeInterval(100.into()).into());
+        announce.header.sequence_id = 3;
+        bmca.register_announce_message(&announce.header, &announce);
+        assert!(bmca.take_best_port_announce_message().is_some());
+        bmca.step_age(TimeInterval(100.into()).into());
+        announce.header.sequence_id = 4;
+        bmca.register_announce_message(&announce.header, &announce);
+        assert!(bmca.take_best_port_announce_message().is_some());
+        bmca.step_age(TimeInterval(100.into()).into());
+        announce.header.sequence_id = 5;
+        bmca.register_announce_message(&announce.header, &announce);
+        assert!(bmca.take_best_port_announce_message().is_some());
+    }
+
+    #[test]
     fn test_acceptable_master_filter() {
         let mut bmca = Bmca::new(
             std::vec![],
@@ -443,21 +488,23 @@ mod tests {
         assert_eq!(message1.compare(&message2), Ordering::Less)
     }
 
-    fn default_own_data() -> DefaultDS {
+    fn default_own_data() -> InternalDefaultDS {
         let clock_identity = Default::default();
         let priority_1 = 0;
         let priority_2 = 0;
         let domain_number = 0;
         let slave_only = false;
         let sdo_id = Default::default();
+        let path_trace = false;
 
-        DefaultDS::new(InstanceConfig {
+        InternalDefaultDS::new(InstanceConfig {
             clock_identity,
             priority_1,
             priority_2,
             domain_number,
             slave_only,
             sdo_id,
+            path_trace,
         })
     }
 
@@ -468,7 +515,7 @@ mod tests {
         // zero is reserved
         own_data.clock_quality.clock_class = 1;
 
-        let call = |port_state: &PortState<()>| {
+        let call = |port_state: &PortState| {
             Bmca::<()>::calculate_recommended_state(&own_data, None, None, port_state)
         };
 
@@ -491,14 +538,16 @@ mod tests {
         let domain_number = 0;
         let slave_only = false;
         let sdo_id = Default::default();
+        let path_trace = false;
 
-        let mut own_data = DefaultDS::new(InstanceConfig {
+        let mut own_data = InternalDefaultDS::new(InstanceConfig {
             clock_identity,
             priority_1,
             priority_2,
             domain_number,
             slave_only,
             sdo_id,
+            path_trace,
         });
 
         own_data.clock_quality.clock_class = 1;
@@ -516,7 +565,7 @@ mod tests {
 
         assert_eq!(
             Some(RecommendedState::M1(own_data)),
-            Bmca::<()>::calculate_recommended_state::<()>(
+            Bmca::<()>::calculate_recommended_state(
                 &own_data,
                 None,
                 Some(port_message),
@@ -537,7 +586,7 @@ mod tests {
 
         assert_eq!(
             Some(RecommendedState::M1(own_data)),
-            Bmca::<()>::calculate_recommended_state::<()>(
+            Bmca::<()>::calculate_recommended_state(
                 &own_data,
                 None,
                 Some(port_message),
@@ -565,7 +614,7 @@ mod tests {
 
         assert_eq!(
             Some(RecommendedState::P1(port_message.message)),
-            Bmca::<()>::calculate_recommended_state::<()>(
+            Bmca::<()>::calculate_recommended_state(
                 &own_data,
                 None,
                 Some(port_message),
@@ -593,7 +642,7 @@ mod tests {
 
         assert_eq!(
             Some(RecommendedState::M2(own_data)),
-            Bmca::<()>::calculate_recommended_state::<()>(
+            Bmca::<()>::calculate_recommended_state(
                 &own_data,
                 Some(global_message),
                 None,
@@ -614,7 +663,7 @@ mod tests {
 
         assert_eq!(
             Some(RecommendedState::M2(own_data)),
-            Bmca::<()>::calculate_recommended_state::<()>(
+            Bmca::<()>::calculate_recommended_state(
                 &own_data,
                 Some(global_message),
                 None,
@@ -642,7 +691,7 @@ mod tests {
 
         assert_eq!(
             Some(RecommendedState::S1(global_message.message)),
-            Bmca::<()>::calculate_recommended_state::<()>(
+            Bmca::<()>::calculate_recommended_state(
                 &own_data,
                 Some(global_message),
                 Some(global_message),
@@ -685,7 +734,7 @@ mod tests {
 
         assert_eq!(
             Some(RecommendedState::M3(global_message.message)),
-            Bmca::<()>::calculate_recommended_state::<()>(
+            Bmca::<()>::calculate_recommended_state(
                 &own_data,
                 Some(global_message),
                 Some(port_message),
@@ -728,7 +777,7 @@ mod tests {
 
         assert_eq!(
             Some(RecommendedState::M3(global_message.message)),
-            Bmca::<()>::calculate_recommended_state::<()>(
+            Bmca::<()>::calculate_recommended_state(
                 &own_data,
                 Some(global_message),
                 Some(port_message),

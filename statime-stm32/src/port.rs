@@ -13,17 +13,26 @@ use statime::{
         TimePropertiesDS, TimeSource,
     },
     filters::BasicFilter,
-    port::{InBmca, PortAction, PortActionIterator, Running, TimestampContext},
+    port::{InBmca, NoForwardedTLVs, PortAction, PortActionIterator, Running, TimestampContext},
     time::{Duration, Interval, Time},
     PtpInstance,
 };
 use stm32_eth::dma::PacketId;
 use stm32f7xx_hal::rng::Rng;
 
-use crate::{ethernet::NetworkStack, ptp_clock::PtpClock};
+use crate::{
+    ethernet::NetworkStack, ptp_clock::PtpClock, ptp_state_mutex::PtpStateMutex, StmPtpInstance,
+};
 
-type StmPort<State> =
-    statime::port::Port<State, AcceptAnyMaster, Rng, &'static PtpClock, BasicFilter>;
+type StmPort<State> = statime::port::Port<
+    'static,
+    State,
+    AcceptAnyMaster,
+    Rng,
+    &'static PtpClock,
+    BasicFilter,
+    PtpStateMutex,
+>;
 
 pub struct Port {
     timer_sender: Sender<'static, (TimerName, core::time::Duration), 4>,
@@ -39,7 +48,7 @@ impl Port {
         packet_id_sender: Sender<'static, (TimestampContext, PacketId), 16>,
         event_socket: SocketHandle,
         general_socket: SocketHandle,
-        state: StmPort<InBmca<'static>>,
+        state: StmPort<InBmca>,
     ) -> Self {
         Self {
             timer_sender,
@@ -72,7 +81,7 @@ impl Port {
     pub fn handle_timer(&mut self, timer: TimerName, net: &mut impl Mutex<T = NetworkStack>) {
         let mut running_port_state = self.state.take_running();
         let actions = match timer {
-            TimerName::Announce => running_port_state.handle_announce_timer(),
+            TimerName::Announce => running_port_state.handle_announce_timer(&mut NoForwardedTLVs),
             TimerName::Sync => running_port_state.handle_sync_timer(),
             TimerName::DelayRequest => running_port_state.handle_delay_request_timer(),
             TimerName::AnnounceReceipt => running_port_state.handle_announce_receipt_timer(),
@@ -96,7 +105,7 @@ impl Port {
 
     pub fn perform_bmca(
         &mut self,
-        f: impl FnOnce(&mut StmPort<InBmca<'static>>),
+        f: impl FnOnce(&mut StmPort<InBmca>),
         net: &mut impl Mutex<T = NetworkStack>,
     ) {
         let bmca_state = self.state.make_bmca_mode();
@@ -115,7 +124,7 @@ impl Port {
 
         for action in actions {
             match action {
-                PortAction::SendEvent { context, data } => {
+                PortAction::SendEvent { context, data, .. } => {
                     const TO: IpEndpoint = IpEndpoint {
                         addr: IpAddress::v4(224, 0, 1, 129),
                         port: 319,
@@ -127,7 +136,7 @@ impl Port {
                         }
                     }
                 }
-                PortAction::SendGeneral { data } => {
+                PortAction::SendGeneral { data, .. } => {
                     const TO: IpEndpoint = IpEndpoint {
                         addr: IpAddress::v4(224, 0, 1, 129),
                         port: 320,
@@ -164,6 +173,8 @@ impl Port {
                         .try_send((TimerName::FilterUpdate, duration))
                         .ok());
                 }
+                // Single port implementation, so no need to forward TLVs
+                PortAction::ForwardTLV { .. } => {}
             }
         }
     }
@@ -180,14 +191,14 @@ impl Port {
 #[allow(clippy::large_enum_variant)]
 enum PortState {
     None,
-    Running(StmPort<Running<'static>>),
-    InBmca(StmPort<InBmca<'static>>),
+    Running(StmPort<Running>),
+    InBmca(StmPort<InBmca>),
 }
 
 impl PortState {
     /// Change to state to the [PortState::InBmca] mode and return a reference
     /// to it.
-    fn make_bmca_mode(&mut self) -> &mut StmPort<InBmca<'static>> {
+    fn make_bmca_mode(&mut self) -> &mut StmPort<InBmca> {
         *self = match core::mem::replace(self, PortState::None) {
             PortState::Running(port) => PortState::InBmca(port.start_bmca()),
             val => val,
@@ -217,7 +228,7 @@ impl PortState {
 
     /// Get the running port and leave behind an empty port. Panics if the port
     /// is not currently in running mode.
-    fn take_running(&mut self) -> StmPort<Running<'static>> {
+    fn take_running(&mut self) -> StmPort<Running> {
         match core::mem::replace(self, PortState::None) {
             Self::Running(v) => v,
             _ => defmt::panic!("Port is not in running mode"),
@@ -225,7 +236,7 @@ impl PortState {
     }
 
     /// Set the port to running after a previous [Self::take_running].
-    fn set_running(&mut self, port: StmPort<Running<'static>>) {
+    fn set_running(&mut self, port: StmPort<Running>) {
         match self {
             PortState::None => *self = Self::Running(port),
             _ => defmt::panic!("Port not in empty state"),
@@ -264,7 +275,7 @@ pub fn setup_statime(
     ptp_peripheral: stm32_eth::ptp::EthernetPTP,
     mac_address: [u8; 6],
     rng: Rng,
-) -> (&'static PtpInstance<BasicFilter>, StmPort<InBmca<'static>>) {
+) -> (&'static StmPtpInstance, StmPort<InBmca>) {
     static PTP_CLOCK: StaticCell<PtpClock> = StaticCell::new();
     let ptp_clock = &*PTP_CLOCK.init(PtpClock::new(ptp_peripheral));
 
@@ -275,10 +286,11 @@ pub fn setup_statime(
         domain_number: 0,
         slave_only: false,
         sdo_id: SdoId::default(),
+        path_trace: false,
     };
     let time_properties_ds =
         TimePropertiesDS::new_arbitrary_time(false, false, TimeSource::InternalOscillator);
-    static PTP_INSTANCE: StaticCell<PtpInstance<BasicFilter>> = StaticCell::new();
+    static PTP_INSTANCE: StaticCell<StmPtpInstance> = StaticCell::new();
     let ptp_instance = &*PTP_INSTANCE.init(PtpInstance::new(instance_config, time_properties_ds));
 
     let port_config = PortConfig {

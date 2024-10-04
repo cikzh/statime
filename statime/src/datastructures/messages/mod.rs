@@ -5,15 +5,15 @@ pub(crate) use delay_req::*;
 pub(crate) use delay_resp::*;
 pub(crate) use follow_up::*;
 pub use header::*;
+pub(crate) use p_delay_req::*;
+pub(crate) use p_delay_resp::*;
+pub(crate) use p_delay_resp_follow_up::*;
 pub(crate) use sync::*;
 
-use self::{
-    management::ManagementMessage, p_delay_req::PDelayReqMessage, p_delay_resp::PDelayRespMessage,
-    p_delay_resp_follow_up::PDelayRespFollowUpMessage, signalling::SignalingMessage,
-};
+use self::{management::ManagementMessage, signalling::SignalingMessage};
 use super::{
     common::{PortIdentity, TimeInterval, TlvSet, WireTimestamp},
-    datasets::DefaultDS,
+    datasets::InternalDefaultDS,
     WireFormatError,
 };
 use crate::{
@@ -39,7 +39,7 @@ mod sync;
 ///
 /// This can be used to preallocate buffers that can always fit packets send by
 /// `statime`.
-pub const MAX_DATA_LEN: usize = 255;
+pub const MAX_DATA_LEN: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -56,7 +56,7 @@ pub enum MessageType {
     Management = 0xd,
 }
 
-pub struct EnumConversionError(u8);
+pub struct EnumConversionError;
 
 impl TryFrom<u8> for MessageType {
     type Error = EnumConversionError;
@@ -75,7 +75,7 @@ impl TryFrom<u8> for MessageType {
             0xb => Ok(Announce),
             0xc => Ok(Signaling),
             0xd => Ok(Management),
-            _ => Err(EnumConversionError(value)),
+            _ => Err(EnumConversionError),
         }
     }
 }
@@ -84,8 +84,8 @@ impl TryFrom<u8> for MessageType {
 pub use fuzz::FuzzMessage;
 
 #[cfg(feature = "fuzz")]
+#[allow(missing_docs)] // These are only used for internal fuzzing
 mod fuzz {
-    #![allow(missing_docs)] // These are only used for internal fuzzing
     use super::*;
     use crate::datastructures::{common::Tlv, WireFormatError};
 
@@ -119,21 +119,6 @@ pub(crate) struct Message<'a> {
     pub(crate) header: Header,
     pub(crate) body: MessageBody,
     pub(crate) suffix: TlvSet<'a>,
-}
-
-impl<'a> Message<'a> {
-    pub(crate) fn is_event(&self) -> bool {
-        use MessageBody::*;
-        match self.body {
-            Sync(_) | DelayReq(_) | PDelayReq(_) | PDelayResp(_) => true,
-            FollowUp(_)
-            | DelayResp(_)
-            | PDelayRespFollowUp(_)
-            | Announce(_)
-            | Signaling(_)
-            | Management(_) => false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,7 +223,11 @@ impl MessageBody {
     }
 }
 
-fn base_header(default_ds: &DefaultDS, port_identity: PortIdentity, sequence_id: u16) -> Header {
+fn base_header(
+    default_ds: &InternalDefaultDS,
+    port_identity: PortIdentity,
+    sequence_id: u16,
+) -> Header {
     Header {
         sdo_id: default_ds.sdo_id,
         domain_number: default_ds.domain_number,
@@ -248,9 +237,16 @@ fn base_header(default_ds: &DefaultDS, port_identity: PortIdentity, sequence_id:
     }
 }
 
+/// Checks whether message is of PTP revision compatible with Statime
+pub fn is_compatible(buffer: &[u8]) -> bool {
+    // this ensures that versionPTP in the header is 2
+    // it will never happen in PTPv1 packets because this octet is the LSB of versionPTP there
+    (buffer.len() >= 2) && (buffer[1] & 0xF) == 2
+}
+
 impl Message<'_> {
     pub(crate) fn sync(
-        default_ds: &DefaultDS,
+        default_ds: &InternalDefaultDS,
         port_identity: PortIdentity,
         sequence_id: u16,
     ) -> Self {
@@ -269,7 +265,7 @@ impl Message<'_> {
     }
 
     pub(crate) fn follow_up(
-        default_ds: &DefaultDS,
+        default_ds: &InternalDefaultDS,
         port_identity: PortIdentity,
         sequence_id: u16,
         timestamp: Time,
@@ -325,7 +321,7 @@ impl Message<'_> {
     }
 
     pub(crate) fn delay_req(
-        default_ds: &DefaultDS,
+        default_ds: &InternalDefaultDS,
         port_identity: PortIdentity,
         sequence_id: u16,
     ) -> Self {
@@ -371,6 +367,58 @@ impl Message<'_> {
         Message {
             header,
             body,
+            suffix: TlvSet::default(),
+        }
+    }
+
+    pub(crate) fn pdelay_req(
+        default_ds: &InternalDefaultDS,
+        port_identity: PortIdentity,
+        sequence_id: u16,
+    ) -> Self {
+        Message {
+            header: base_header(default_ds, port_identity, sequence_id),
+            body: MessageBody::PDelayReq(PDelayReqMessage {
+                origin_timestamp: WireTimestamp::default(),
+            }),
+            suffix: TlvSet::default(),
+        }
+    }
+
+    pub(crate) fn pdelay_resp(
+        default_ds: &InternalDefaultDS,
+        port_identity: PortIdentity,
+        request_header: Header,
+        timestamp: Time,
+    ) -> Self {
+        // We implement Option B from IEEE 1588-2019 page 202
+        Message {
+            header: Header {
+                two_step_flag: true,
+                correction_field: request_header.correction_field,
+                ..base_header(default_ds, port_identity, request_header.sequence_id)
+            },
+            body: MessageBody::PDelayResp(PDelayRespMessage {
+                request_receive_timestamp: timestamp.into(),
+                requesting_port_identity: request_header.source_port_identity,
+            }),
+            suffix: TlvSet::default(),
+        }
+    }
+
+    pub(crate) fn pdelay_resp_follow_up(
+        default_ds: &InternalDefaultDS,
+        port_identity: PortIdentity,
+        requestor_identity: PortIdentity,
+        sequence_id: u16,
+        timestamp: Time,
+    ) -> Self {
+        Message {
+            header: base_header(default_ds, port_identity, sequence_id),
+            body: MessageBody::PDelayRespFollowUp(PDelayRespFollowUpMessage {
+                response_origin_timestamp: timestamp.into(),
+                requesting_port_identity: requestor_identity,
+            }),
             suffix: TlvSet::default(),
         }
     }

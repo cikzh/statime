@@ -3,27 +3,30 @@ use std::{
     future::Future,
     path::PathBuf,
     pin::{pin, Pin},
+    sync::RwLock,
 };
 
 use clap::Parser;
-use fern::colors::Color;
 use rand::{rngs::StdRng, SeedableRng};
 use statime::{
     config::{ClockIdentity, InstanceConfig, SdoId, TimePropertiesDS, TimeSource},
     filters::{Filter, KalmanConfiguration, KalmanFilter},
     port::{
-        InBmca, Measurement, Port, PortAction, PortActionIterator, TimestampContext, MAX_DATA_LEN,
+        is_message_buffer_compatible, InBmca, Measurement, Port, PortAction, PortActionIterator,
+        TimestampContext, MAX_DATA_LEN,
     },
     time::Time,
-    PtpInstance,
+    Clock, OverlayClock, PtpInstance, PtpInstanceState, SharedClock,
 };
 use statime_linux::{
-    clock::LinuxClock,
-    config::Config,
+    clock::{LinuxClock, PortTimestampToTime},
+    initialize_logging_parse_config,
+    observer::ObservableInstanceState,
     socket::{
         open_ethernet_socket, open_ipv4_event_socket, open_ipv4_general_socket,
-        open_ipv6_event_socket, open_ipv6_general_socket, timestamp_to_time, PtpTargetAddress,
+        open_ipv6_event_socket, open_ipv6_general_socket, PtpTargetAddress,
     },
+    tlvforwarder::TlvForwarder,
 };
 use timestamped_socket::{
     interface::interfaces,
@@ -35,42 +38,23 @@ use tokio::{
     time::Sleep,
 };
 
-#[derive(Clone, Copy)]
-struct SdoIdParser;
-
-impl clap::builder::TypedValueParser for SdoIdParser {
-    type Value = SdoId;
-
-    fn parse_ref(
-        &self,
-        cmd: &clap::Command,
-        arg: Option<&clap::Arg>,
-        value: &std::ffi::OsStr,
-    ) -> Result<Self::Value, clap::Error> {
-        use clap::error::{ContextKind, ContextValue, ErrorKind};
-
-        let inner = clap::value_parser!(u16);
-        let val = inner.parse_ref(cmd, arg, value)?;
-
-        match SdoId::try_from(val) {
-            Ok(v) => Ok(v),
-            Err(()) => {
-                let mut err = clap::Error::new(ErrorKind::ValueValidation).with_cmd(cmd);
-                if let Some(arg) = arg {
-                    err.insert(
-                        ContextKind::InvalidArg,
-                        ContextValue::String(arg.to_string()),
-                    );
-                }
-                err.insert(
-                    ContextKind::InvalidValue,
-                    ContextValue::String(val.to_string()),
-                );
-                Err(err)
-            }
-        }
+trait PortClock:
+    Clock<Error = <LinuxClock as Clock>::Error> + PortTimestampToTime + Send + Sync
+{
+    fn clone_box(&self) -> Box<dyn PortClock>;
+}
+impl PortClock for LinuxClock {
+    fn clone_box(&self) -> Box<dyn PortClock> {
+        Box::new(self.clone())
     }
 }
+impl PortClock for SharedClock<OverlayClock<LinuxClock>> {
+    fn clone_box(&self) -> Box<dyn PortClock> {
+        Box::new(self.clone())
+    }
+}
+type BoxedClock = Box<dyn PortClock>;
+type SharedOverlayClock = SharedClock<OverlayClock<LinuxClock>>;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -82,39 +66,6 @@ pub struct Args {
         default_value = "/etc/statime/statime.toml"
     )]
     config_file: Option<PathBuf>,
-}
-
-fn setup_logger(level: log::LevelFilter) -> Result<(), fern::InitError> {
-    let colors = fern::colors::ColoredLevelConfig::new()
-        .error(Color::Red)
-        .warn(Color::Yellow)
-        .info(Color::BrightGreen)
-        .debug(Color::BrightBlue)
-        .trace(Color::BrightBlack);
-
-    fern::Dispatch::new()
-        .format(move |out, message, record| {
-            use std::time::{SystemTime, UNIX_EPOCH};
-
-            let delta = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-
-            let h = delta.as_secs() % (24 * 60 * 60) / (60 * 60);
-            let m = delta.as_secs() % (60 * 60) / 60;
-            let s = delta.as_secs() % 60;
-            let f = delta.as_secs_f64().fract() * 1e7;
-
-            out.finish(format_args!(
-                "{}[{}][{}] {}",
-                format_args!("[{h:02}:{m:02}:{s:02}.{f:07}]"),
-                record.target(),
-                colors.color(record.level()),
-                message
-            ))
-        })
-        .level(level)
-        .chain(std::io::stdout())
-        .apply()?;
-    Ok(())
 }
 
 pin_project_lite::pin_project! {
@@ -160,6 +111,20 @@ impl Future for Timer {
     }
 }
 
+#[derive(Debug, Clone)]
+enum SystemClock {
+    Linux(LinuxClock),
+    Overlay(SharedOverlayClock),
+}
+impl SystemClock {
+    fn clone_boxed(&self) -> BoxedClock {
+        match self {
+            Self::Linux(clock) => Box::new(clock.clone()),
+            Self::Overlay(clock) => Box::new(clock.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 enum ClockSyncMode {
     #[default]
@@ -167,16 +132,33 @@ enum ClockSyncMode {
     ToSystem,
 }
 
-fn start_clock_task(clock: LinuxClock) -> tokio::sync::watch::Sender<ClockSyncMode> {
+fn start_clock_task(
+    clock: LinuxClock,
+    system_clock: SystemClock,
+) -> tokio::sync::watch::Sender<ClockSyncMode> {
     let (mode_sender, mode_receiver) = tokio::sync::watch::channel(ClockSyncMode::FromSystem);
 
-    tokio::spawn(clock_task(clock, mode_receiver));
+    match system_clock {
+        SystemClock::Linux(system_clock) => {
+            tokio::spawn(clock_task(clock, system_clock, None, mode_receiver));
+        }
+        SystemClock::Overlay(overlay_clock) => {
+            tokio::spawn(clock_task(
+                clock,
+                overlay_clock.clone(),
+                Some(overlay_clock),
+                mode_receiver,
+            ));
+        }
+    }
 
     mode_sender
 }
 
-async fn clock_task(
-    clock: LinuxClock,
+async fn clock_task<C: Clock<Error = impl core::fmt::Debug>>(
+    mut clock: LinuxClock,
+    mut system_clock: C,
+    system_clock_overlay: Option<SharedOverlayClock>,
     mut mode_receiver: tokio::sync::watch::Receiver<ClockSyncMode>,
 ) {
     let mut measurement_timer = pin!(Timer::new());
@@ -187,14 +169,17 @@ async fn clock_task(
     let mut filter = KalmanFilter::new(KalmanConfiguration::default());
 
     let mut current_mode = *mode_receiver.borrow_and_update();
-    let mut filter_clock = match current_mode {
-        ClockSyncMode::FromSystem => clock.clone(),
-        ClockSyncMode::ToSystem => LinuxClock::CLOCK_TAI,
-    };
     loop {
         tokio::select! {
             () = &mut measurement_timer => {
-                let (t1, t2, t3) = clock.system_offset().expect("Unable to determine offset from system clock");
+                let (raw_t1, t2, raw_t3) = clock.system_offset().expect("Unable to determine offset from system clock");
+                let (t1, t3) = match &system_clock_overlay {
+                    Some(shared) => {
+                        let overlay = shared.0.lock().expect("shared clock lock is tainted");
+                        (overlay.time_from_underlying(raw_t1), overlay.time_from_underlying(raw_t3))
+                    },
+                    None => (raw_t1, raw_t3)
+                };
 
                 log::debug!("Interclock measurement: {} {} {}", t1, t2, t3);
 
@@ -202,24 +187,31 @@ async fn clock_task(
                 let offset_a = t2 - t1;
                 let offset_b = t3 - t2;
 
-                let m = match current_mode {
-                    ClockSyncMode::FromSystem => Measurement {
-                        event_time: t2,
-                        offset: Some(offset_a - delay),
-                        delay: Some(delay),
-                        raw_sync_offset: Some(offset_a),
-                        raw_delay_offset: Some(-offset_b),
+                let update = match current_mode {
+                    ClockSyncMode::FromSystem => {
+                        let m = Measurement {
+                            event_time: t2,
+                            offset: Some(offset_a - delay),
+                            delay: Some(delay),
+                            peer_delay: None,
+                            raw_sync_offset: Some(offset_a),
+                            raw_delay_offset: Some(-offset_b),
+                        };
+                        filter.measurement(m, &mut clock)
                     },
-                    ClockSyncMode::ToSystem => Measurement {
-                        event_time: t1+delay,
-                        offset: Some(offset_b - delay),
-                        delay: Some(delay),
-                        raw_sync_offset: Some(offset_b),
-                        raw_delay_offset: Some(-offset_a),
+                    ClockSyncMode::ToSystem => {
+                        let m = Measurement {
+                            event_time: t1+delay,
+                            offset: Some(offset_b - delay),
+                            delay: Some(delay),
+                            peer_delay: None,
+                            raw_sync_offset: Some(offset_b),
+                            raw_delay_offset: Some(-offset_a),
+                        };
+                        filter.measurement(m, &mut system_clock)
                     },
                 };
 
-                let update = filter.measurement(m, &mut filter_clock);
                 if let Some(timeout) = update.next_update {
                     update_timer.as_mut().reset(timeout);
                 }
@@ -227,7 +219,10 @@ async fn clock_task(
                 measurement_timer.as_mut().reset(std::time::Duration::from_millis(250));
             }
             () = &mut update_timer => {
-                let update = filter.update(&mut filter_clock);
+                let update = match current_mode {
+                    ClockSyncMode::FromSystem => filter.update(&mut clock),
+                    ClockSyncMode::ToSystem => filter.update(&mut system_clock),
+                };
                 if let Some(timeout) = update.next_update {
                     update_timer.as_mut().reset(timeout);
                 }
@@ -237,11 +232,10 @@ async fn clock_task(
                 if new_mode != current_mode {
                     let mut new_filter = KalmanFilter::new(KalmanConfiguration::default());
                     std::mem::swap(&mut filter, &mut new_filter);
-                    new_filter.demobilize(&mut filter_clock);
-                    match new_mode {
-                        ClockSyncMode::FromSystem => filter_clock = clock.clone(),
-                        ClockSyncMode::ToSystem => filter_clock = LinuxClock::CLOCK_TAI,
-                    }
+                    match current_mode {
+                        ClockSyncMode::FromSystem => new_filter.demobilize(&mut clock),
+                        ClockSyncMode::ToSystem => new_filter.demobilize(&mut system_clock)
+                    };
                     current_mode = new_mode;
                 }
             }
@@ -257,14 +251,11 @@ async fn main() {
 async fn actual_main() {
     let args = Args::parse();
 
-    let config = Config::from_file(
+    let config = initialize_logging_parse_config(
         &args
             .config_file
             .expect("could not determine config file path"),
-    )
-    .unwrap_or_else(|e| panic!("error loading config: {e}"));
-
-    setup_logger(config.loglevel).expect("could not setup logging");
+    );
 
     let clock_identity = config.identity.unwrap_or(ClockIdentity(
         get_clock_id().expect("could not get clock identity"),
@@ -279,10 +270,17 @@ async fn actual_main() {
         domain_number: config.domain,
         slave_only: false,
         sdo_id: SdoId::try_from(config.sdo_id).expect("sdo-id should be between 0 and 4095"),
+        path_trace: config.path_trace,
     };
 
     let time_properties_ds =
         TimePropertiesDS::new_arbitrary_time(false, false, TimeSource::InternalOscillator);
+
+    let system_clock = if config.virtual_system_clock {
+        SystemClock::Overlay(SharedClock::new(OverlayClock::new(LinuxClock::CLOCK_TAI)))
+    } else {
+        SystemClock::Linux(LinuxClock::CLOCK_TAI)
+    };
 
     // Leak to get a static reference, the ptp instance will be around for the rest
     // of the program anyway
@@ -290,6 +288,17 @@ async fn actual_main() {
         instance_config,
         time_properties_ds,
     )));
+
+    // The observer for the metrics exporter
+    let (instance_state_sender, instance_state_receiver) =
+        tokio::sync::watch::channel(ObservableInstanceState {
+            default_ds: instance.default_ds(),
+            current_ds: instance.current_ds(),
+            parent_ds: instance.parent_ds(),
+            time_properties_ds: instance.time_properties_ds(),
+            path_trace_ds: instance.path_trace_ds(),
+        });
+    statime_linux::observer::spawn(&config, instance_state_receiver).await;
 
     let (bmca_notify_sender, bmca_notify_receiver) = tokio::sync::watch::channel(false);
 
@@ -301,49 +310,62 @@ async fn actual_main() {
     let mut clock_name_map = HashMap::new();
     let mut clock_port_map = Vec::with_capacity(config.ports.len());
 
+    let mut ports = Vec::with_capacity(config.ports.len());
+
+    let tlv_forwarder = TlvForwarder::new();
+
     for port_config in config.ports {
         let interface = port_config.interface;
         let network_mode = port_config.network_mode;
-        let (port_clock, timestamping) = match &port_config.hardware_clock {
-            Some(path) => {
-                let clock = LinuxClock::open(path).expect("Unable to open clock");
-                if let Some(id) = clock_name_map.get(path) {
+        let (port_clock, timestamping) = match port_config.hardware_clock {
+            Some(idx) => {
+                let mut clock = LinuxClock::open_idx(idx).expect("Unable to open clock");
+                if let Some(id) = clock_name_map.get(&idx) {
                     clock_port_map.push(Some(*id));
                 } else {
+                    clock.init().expect("Unable to initialize clock");
                     let id = internal_sync_senders.len();
                     clock_port_map.push(Some(id));
-                    clock_name_map.insert(path.clone(), id);
-                    internal_sync_senders.push(start_clock_task(clock.clone()));
+                    clock_name_map.insert(idx, id);
+                    internal_sync_senders
+                        .push(start_clock_task(clock.clone(), system_clock.clone()));
                 }
-                (clock, InterfaceTimestampMode::HardwarePTPAll)
+                (
+                    Box::new(clock) as BoxedClock,
+                    InterfaceTimestampMode::HardwarePTPAll,
+                )
             }
             None => {
                 clock_port_map.push(None);
-                (LinuxClock::CLOCK_TAI, InterfaceTimestampMode::SoftwareAll)
+                (
+                    system_clock.clone_boxed(),
+                    InterfaceTimestampMode::SoftwareAll,
+                )
             }
         };
+
         let rng = StdRng::from_entropy();
+        let bind_phc = port_config.hardware_clock;
         let port = instance.add_port(
             port_config.into(),
             KalmanConfiguration::default(),
-            port_clock.clone(),
+            port_clock.clone_box(),
             rng,
         );
 
         let (main_task_sender, port_task_receiver) = tokio::sync::mpsc::channel(1);
         let (port_task_sender, main_task_receiver) = tokio::sync::mpsc::channel(1);
 
-        main_task_sender
-            .send(port)
-            .await
-            .expect("space in channel buffer");
-
+        // We can't send the port yet, since that may start running on the port,
+        // inhibiting write access to the instance and making it impossible to
+        // create more ports.
+        ports.push(port);
         main_task_senders.push(main_task_sender);
         main_task_receivers.push(main_task_receiver);
 
         match network_mode {
             statime_linux::config::NetworkMode::Ipv4 => {
-                let event_socket = open_ipv4_event_socket(interface, timestamping)
+                let event_socket = open_ipv4_event_socket(interface, timestamping, bind_phc)
                     .expect("Could not open event socket");
                 let general_socket =
                     open_ipv4_general_socket(interface).expect("Could not open general socket");
@@ -354,11 +376,12 @@ async fn actual_main() {
                     event_socket,
                     general_socket,
                     bmca_notify_receiver.clone(),
+                    tlv_forwarder.duplicate(),
                     port_clock,
                 ));
             }
             statime_linux::config::NetworkMode::Ipv6 => {
-                let event_socket = open_ipv6_event_socket(interface, timestamping)
+                let event_socket = open_ipv6_event_socket(interface, timestamping, bind_phc)
                     .expect("Could not open event socket");
                 let general_socket =
                     open_ipv6_general_socket(interface).expect("Could not open general socket");
@@ -369,12 +392,13 @@ async fn actual_main() {
                     event_socket,
                     general_socket,
                     bmca_notify_receiver.clone(),
+                    tlv_forwarder.duplicate(),
                     port_clock,
                 ));
             }
             statime_linux::config::NetworkMode::Ethernet => {
-                let socket =
-                    open_ethernet_socket(interface, timestamping).expect("Could not open socket");
+                let socket = open_ethernet_socket(interface, timestamping, bind_phc)
+                    .expect("Could not open socket");
 
                 tokio::spawn(ethernet_port_task(
                     port_task_receiver,
@@ -384,15 +408,28 @@ async fn actual_main() {
                         .expect("Unable to get network interface index") as _,
                     socket,
                     bmca_notify_receiver.clone(),
+                    tlv_forwarder.duplicate(),
                     port_clock,
                 ));
             }
         }
     }
 
+    // Drop the forwarder so we don't keep an unneeded subscriber.
+    drop(tlv_forwarder);
+
+    // All ports created, so we can start running them.
+    for (i, port) in ports.into_iter().enumerate() {
+        main_task_senders[i]
+            .send(port)
+            .await
+            .expect("space in channel buffer");
+    }
+
     run(
         instance,
         bmca_notify_sender,
+        instance_state_sender,
         main_task_receivers,
         main_task_senders,
         internal_sync_senders,
@@ -402,8 +439,9 @@ async fn actual_main() {
 }
 
 async fn run(
-    instance: &'static PtpInstance<KalmanFilter>,
+    instance: &'static PtpInstance<KalmanFilter, RwLock<PtpInstanceState>>,
     bmca_notify_sender: tokio::sync::watch::Sender<bool>,
+    instance_state_sender: tokio::sync::watch::Sender<ObservableInstanceState>,
     mut main_task_receivers: Vec<Receiver<BmcaPort>>,
     main_task_senders: Vec<Sender<BmcaPort>>,
     internal_sync_senders: Vec<tokio::sync::watch::Sender<ClockSyncMode>>,
@@ -443,6 +481,16 @@ async fn run(
 
         instance.bmca(&mut mut_bmca_ports);
 
+        // Update instance state for observability
+        // We don't care if isn't anybody on the other side
+        let _ = instance_state_sender.send(ObservableInstanceState {
+            default_ds: instance.default_ds(),
+            current_ds: instance.current_ds(),
+            parent_ds: instance.parent_ds(),
+            time_properties_ds: instance.time_properties_ds(),
+            path_trace_ds: instance.path_trace_ds(),
+        });
+
         let mut clock_states = vec![ClockSyncMode::FromSystem; internal_sync_senders.len()];
         for (idx, port) in mut_bmca_ports.iter().enumerate() {
             if port.is_steering() {
@@ -463,7 +511,15 @@ async fn run(
     }
 }
 
-type BmcaPort = Port<InBmca<'static>, Option<Vec<ClockIdentity>>, StdRng, LinuxClock, KalmanFilter>;
+type BmcaPort = Port<
+    'static,
+    InBmca,
+    Option<Vec<ClockIdentity>>,
+    StdRng,
+    BoxedClock,
+    KalmanFilter,
+    RwLock<PtpInstanceState>,
+>;
 
 // the Port task
 //
@@ -477,7 +533,8 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
     mut event_socket: Socket<A, Open>,
     mut general_socket: Socket<A, Open>,
     mut bmca_notify: tokio::sync::watch::Receiver<bool>,
-    clock: LinuxClock,
+    mut tlv_forwarder: TlvForwarder,
+    clock: BoxedClock,
 ) {
     let mut timers = Timers {
         port_sync_timer: pin!(Timer::new()),
@@ -498,6 +555,7 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
             &mut event_socket,
             &mut general_socket,
             &mut timers,
+            &tlv_forwarder,
             &clock,
         )
         .await;
@@ -508,6 +566,7 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
                 &mut event_socket,
                 &mut general_socket,
                 &mut timers,
+                &tlv_forwarder,
                 &clock,
             )
             .await;
@@ -520,12 +579,12 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
             let mut actions = tokio::select! {
                 result = event_socket.recv(&mut event_buffer) => match result {
                     Ok(packet) => {
-                        if let Some(mut timestamp) = packet.timestamp {
-                            // get_tai gives zero if this is a hardware clock, and the needed
-                            // correction when this port uses software timestamping
-                            timestamp.seconds += clock.get_tai_offset().expect("Unable to get tai offset") as libc::time_t;
+                        if !is_message_buffer_compatible(&event_buffer[..packet.bytes_read]) {
+                            // do not spam with missing timestamp error in mixed-version PTPv1+v2 networks
+                            PortActionIterator::empty()
+                        } else if let Some(timestamp) = packet.timestamp {
                             log::trace!("Recv timestamp: {:?}", packet.timestamp);
-                            port.handle_event_receive(&event_buffer[..packet.bytes_read], timestamp_to_time(timestamp))
+                            port.handle_event_receive(&event_buffer[..packet.bytes_read], clock.port_timestamp_to_time(timestamp))
                         } else {
                             log::error!("Missing recv timestamp");
                             PortActionIterator::empty()
@@ -538,7 +597,7 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
                     Err(error) => panic!("Error receiving: {error:?}"),
                 },
                 () = &mut timers.port_announce_timer => {
-                    port.handle_announce_timer()
+                    port.handle_announce_timer(&mut tlv_forwarder)
                 },
                 () = &mut timers.port_sync_timer => {
                     port.handle_sync_timer()
@@ -564,6 +623,7 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
                     &mut event_socket,
                     &mut general_socket,
                     &mut timers,
+                    &tlv_forwarder,
                     &clock,
                 )
                 .await;
@@ -593,7 +653,8 @@ async fn ethernet_port_task(
     interface: libc::c_int,
     mut socket: Socket<EthernetAddress, Open>,
     mut bmca_notify: tokio::sync::watch::Receiver<bool>,
-    clock: LinuxClock,
+    mut tlv_forwarder: TlvForwarder,
+    clock: BoxedClock,
 ) {
     let mut timers = Timers {
         port_sync_timer: pin!(Timer::new()),
@@ -606,11 +667,24 @@ async fn ethernet_port_task(
     loop {
         let port_in_bmca = port_task_receiver.recv().await.unwrap();
 
+        // Clear out old tlvs if we are not in the master state, so we don't keep em too
+        // long.
+        if port_in_bmca.is_master() {
+            tlv_forwarder.empty()
+        }
+
         // handle post-bmca actions
         let (mut port, actions) = port_in_bmca.end_bmca();
 
-        let mut pending_timestamp =
-            handle_actions_ethernet(actions, interface, &mut socket, &mut timers, &clock).await;
+        let mut pending_timestamp = handle_actions_ethernet(
+            actions,
+            interface,
+            &mut socket,
+            &mut timers,
+            &tlv_forwarder,
+            &clock,
+        )
+        .await;
 
         while let Some((context, timestamp)) = pending_timestamp {
             pending_timestamp = handle_actions_ethernet(
@@ -618,6 +692,7 @@ async fn ethernet_port_task(
                 interface,
                 &mut socket,
                 &mut timers,
+                &tlv_forwarder,
                 &clock,
             )
             .await;
@@ -629,12 +704,9 @@ async fn ethernet_port_task(
             let mut actions = tokio::select! {
                 result = socket.recv(&mut event_buffer) => match result {
                     Ok(packet) => {
-                        if let Some(mut timestamp) = packet.timestamp {
-                            // get_tai gives zero if this is a hardware clock, and the needed
-                            // correction when this port uses software timestamping
-                            timestamp.seconds += clock.get_tai_offset().expect("Unable to get tai offset") as libc::time_t;
+                        if let Some(timestamp) = packet.timestamp {
                             log::trace!("Recv timestamp: {:?}", packet.timestamp);
-                            port.handle_event_receive(&event_buffer[..packet.bytes_read], timestamp_to_time(timestamp))
+                            port.handle_event_receive(&event_buffer[..packet.bytes_read], clock.port_timestamp_to_time(timestamp))
                         } else {
                             port.handle_general_receive(&event_buffer[..packet.bytes_read])
                         }
@@ -642,7 +714,7 @@ async fn ethernet_port_task(
                     Err(error) => panic!("Error receiving: {error:?}"),
                 },
                 () = &mut timers.port_announce_timer => {
-                    port.handle_announce_timer()
+                    port.handle_announce_timer(&mut tlv_forwarder)
                 },
                 () = &mut timers.port_sync_timer => {
                     port.handle_sync_timer()
@@ -663,9 +735,15 @@ async fn ethernet_port_task(
             };
 
             loop {
-                let pending_timestamp =
-                    handle_actions_ethernet(actions, interface, &mut socket, &mut timers, &clock)
-                        .await;
+                let pending_timestamp = handle_actions_ethernet(
+                    actions,
+                    interface,
+                    &mut socket,
+                    &mut timers,
+                    &tlv_forwarder,
+                    &clock,
+                )
+                .await;
 
                 // there might be more actions to handle based on the current action
                 actions = match pending_timestamp {
@@ -693,34 +771,49 @@ async fn handle_actions<A: NetworkAddress + PtpTargetAddress>(
     event_socket: &mut Socket<A, Open>,
     general_socket: &mut Socket<A, Open>,
     timers: &mut Timers<'_>,
-    clock: &LinuxClock,
+    tlv_forwarder: &TlvForwarder,
+    clock: &BoxedClock,
 ) -> Option<(TimestampContext, Time)> {
     let mut pending_timestamp = None;
 
     for action in actions {
         match action {
-            PortAction::SendEvent { context, data } => {
+            PortAction::SendEvent {
+                context,
+                data,
+                link_local,
+            } => {
                 // send timestamp of the send
                 let time = event_socket
-                    .send_to(data, A::PRIMARY_EVENT)
+                    .send_to(
+                        data,
+                        if link_local {
+                            A::PDELAY_EVENT
+                        } else {
+                            A::PRIMARY_EVENT
+                        },
+                    )
                     .await
                     .expect("Failed to send event message");
 
                 // anything we send later will have a later pending (send) timestamp
-                if let Some(mut time) = time {
-                    // get_tai gives zero if this is a hardware clock, and the needed
-                    // correction when this port uses software timestamping
-                    time.seconds +=
-                        clock.get_tai_offset().expect("Unable to get tai offset") as libc::time_t;
+                if let Some(time) = time {
                     log::trace!("Send timestamp {:?}", time);
-                    pending_timestamp = Some((context, timestamp_to_time(time)));
+                    pending_timestamp = Some((context, clock.port_timestamp_to_time(time)));
                 } else {
                     log::error!("Missing send timestamp");
                 }
             }
-            PortAction::SendGeneral { data } => {
+            PortAction::SendGeneral { data, link_local } => {
                 general_socket
-                    .send_to(data, A::PRIMARY_GENERAL)
+                    .send_to(
+                        data,
+                        if link_local {
+                            A::PDELAY_GENERAL
+                        } else {
+                            A::PRIMARY_GENERAL
+                        },
+                    )
                     .await
                     .expect("Failed to send general message");
             }
@@ -738,6 +831,9 @@ async fn handle_actions<A: NetworkAddress + PtpTargetAddress>(
             }
             PortAction::ResetFilterUpdateTimer { duration } => {
                 timers.filter_update_timer.as_mut().reset(duration);
+            }
+            PortAction::ForwardTLV { tlv } => {
+                tlv_forwarder.forward(tlv.into_owned());
             }
         }
     }
@@ -750,20 +846,33 @@ async fn handle_actions_ethernet(
     interface: libc::c_int,
     socket: &mut Socket<EthernetAddress, Open>,
     timers: &mut Timers<'_>,
-    clock: &LinuxClock,
+    tlv_forwarder: &TlvForwarder,
+    clock: &BoxedClock,
 ) -> Option<(TimestampContext, Time)> {
     let mut pending_timestamp = None;
 
     for action in actions {
         match action {
-            PortAction::SendEvent { context, data } => {
+            PortAction::SendEvent {
+                context,
+                data,
+                link_local,
+            } => {
                 // send timestamp of the send
                 let time = socket
                     .send_to(
                         data,
                         EthernetAddress::new(
-                            EthernetAddress::PRIMARY_EVENT.protocol(),
-                            EthernetAddress::PRIMARY_EVENT.mac(),
+                            if link_local {
+                                EthernetAddress::PDELAY_EVENT.protocol()
+                            } else {
+                                EthernetAddress::PRIMARY_EVENT.protocol()
+                            },
+                            if link_local {
+                                EthernetAddress::PDELAY_EVENT.mac()
+                            } else {
+                                EthernetAddress::PRIMARY_EVENT.mac()
+                            },
                             interface,
                         ),
                     )
@@ -771,24 +880,28 @@ async fn handle_actions_ethernet(
                     .expect("Failed to send event message");
 
                 // anything we send later will have a later pending (send) timestamp
-                if let Some(mut time) = time {
-                    // get_tai gives zero if this is a hardware clock, and the needed
-                    // correction when this port uses software timestamping
-                    time.seconds +=
-                        clock.get_tai_offset().expect("Unable to get tai offset") as libc::time_t;
+                if let Some(time) = time {
                     log::trace!("Send timestamp {:?}", time);
-                    pending_timestamp = Some((context, timestamp_to_time(time)));
+                    pending_timestamp = Some((context, clock.port_timestamp_to_time(time)));
                 } else {
                     log::error!("Missing send timestamp");
                 }
             }
-            PortAction::SendGeneral { data } => {
+            PortAction::SendGeneral { data, link_local } => {
                 socket
                     .send_to(
                         data,
                         EthernetAddress::new(
-                            EthernetAddress::PRIMARY_GENERAL.protocol(),
-                            EthernetAddress::PRIMARY_GENERAL.mac(),
+                            if link_local {
+                                EthernetAddress::PDELAY_GENERAL.protocol()
+                            } else {
+                                EthernetAddress::PRIMARY_GENERAL.protocol()
+                            },
+                            if link_local {
+                                EthernetAddress::PDELAY_GENERAL.mac()
+                            } else {
+                                EthernetAddress::PRIMARY_GENERAL.mac()
+                            },
                             interface,
                         ),
                     )
@@ -810,6 +923,7 @@ async fn handle_actions_ethernet(
             PortAction::ResetFilterUpdateTimer { duration } => {
                 timers.filter_update_timer.as_mut().reset(duration);
             }
+            PortAction::ForwardTLV { tlv } => tlv_forwarder.forward(tlv.into_owned()),
         }
     }
 

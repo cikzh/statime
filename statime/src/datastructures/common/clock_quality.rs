@@ -3,6 +3,7 @@ use crate::datastructures::{WireFormat, WireFormatError};
 
 /// A description of the accuracy and type of a clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ClockQuality {
     /// The PTP clock class.
     ///
@@ -37,10 +38,6 @@ impl Default for ClockQuality {
 }
 
 impl WireFormat for ClockQuality {
-    fn wire_size(&self) -> usize {
-        4
-    }
-
     fn serialize(&self, buffer: &mut [u8]) -> Result<(), WireFormatError> {
         buffer[0] = self.clock_class;
         buffer[1] = self.clock_accuracy.to_primitive();

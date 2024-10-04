@@ -47,3 +47,20 @@ pub trait Clock {
     /// system.
     fn set_properties(&mut self, time_properties_ds: &TimePropertiesDS) -> Result<(), Self::Error>;
 }
+
+#[cfg(feature = "std")]
+impl<T: Clock + ?Sized> Clock for std::boxed::Box<T> {
+    type Error = T::Error;
+    fn now(&self) -> Time {
+        self.as_ref().now()
+    }
+    fn step_clock(&mut self, offset: Duration) -> Result<Time, Self::Error> {
+        self.as_mut().step_clock(offset)
+    }
+    fn set_frequency(&mut self, ppm: f64) -> Result<Time, Self::Error> {
+        self.as_mut().set_frequency(ppm)
+    }
+    fn set_properties(&mut self, time_properties_ds: &TimePropertiesDS) -> Result<(), Self::Error> {
+        self.as_mut().set_properties(time_properties_ds)
+    }
+}

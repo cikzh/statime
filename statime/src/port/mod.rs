@@ -2,32 +2,34 @@
 //!
 //! See [`Port`] for a detailed description.
 
-use core::ops::Deref;
+use core::{cell::RefCell, ops::ControlFlow};
 
-use arrayvec::ArrayVec;
-use atomic_refcell::{AtomicRef, AtomicRefCell};
+pub use actions::{
+    ForwardedTLV, ForwardedTLVProvider, NoForwardedTLVs, PortAction, PortActionIterator,
+    TimestampContext,
+};
 pub use measurement::Measurement;
 use rand::Rng;
-use state::{MasterState, PortState};
+use state::PortState;
 
-use self::state::SlaveState;
+use self::sequence_id::SequenceIdGenerator;
+pub use crate::datastructures::messages::is_compatible as is_message_buffer_compatible;
 pub use crate::datastructures::messages::MAX_DATA_LEN;
 #[cfg(doc)]
 use crate::PtpInstance;
 use crate::{
     bmc::{
         acceptable_master::AcceptableMasterList,
-        bmca::{BestAnnounceMessage, Bmca, RecommendedState},
+        bmca::{BestAnnounceMessage, Bmca},
     },
     clock::Clock,
     config::PortConfig,
     datastructures::{
-        common::{LeapIndicator, PortIdentity, TimeSource},
-        datasets::{CurrentDS, DefaultDS, ParentDS, TimePropertiesDS},
+        common::PortIdentity,
         messages::{Message, MessageBody},
     },
-    filters::{Filter, FilterUpdate},
-    ptp_instance::PtpInstanceState,
+    filters::Filter,
+    ptp_instance::{PtpInstanceState, PtpInstanceStateMutex},
     time::{Duration, Time},
 };
 
@@ -42,7 +44,7 @@ macro_rules! actions {
         {
             let mut list = ::arrayvec::ArrayVec::new();
             list.push($action);
-            PortActionIterator::from(list)
+            crate::port::PortActionIterator::from(list)
         }
     };
     [$action1:expr, $action2:expr] => {
@@ -50,13 +52,17 @@ macro_rules! actions {
             let mut list = ::arrayvec::ArrayVec::new();
             list.push($action1);
             list.push($action2);
-            PortActionIterator::from(list)
+            crate::port::PortActionIterator::from(list)
         }
     };
 }
 
+mod actions;
+mod bmca;
+mod master;
 mod measurement;
 mod sequence_id;
+mod slave;
 pub(crate) mod state;
 
 /// A single port of the PTP instance
@@ -109,13 +115,13 @@ pub(crate) mod state;
 /// #         }
 /// #     }
 /// # }
+/// # let (instance_config, time_properties_ds) = unimplemented!();
 /// use rand::thread_rng;
 /// use statime::config::{AcceptAnyMaster, DelayMechanism, PortConfig};
 /// use statime::filters::BasicFilter;
 /// use statime::PtpInstance;
 /// use statime::time::Interval;
 ///
-/// # let (instance_config, time_properties_ds) = unimplemented!();
 /// let mut instance = PtpInstance::<BasicFilter>::new(instance_config, time_properties_ds);
 ///
 /// // TODO make these values sensible
@@ -161,7 +167,7 @@ pub(crate) mod state;
 /// #     }
 /// #     pub struct UdpSocket;
 /// #     impl UdpSocket {
-/// #         pub fn send(&mut self, buf: &[u8]) -> statime::time::Time { unimplemented!() }
+/// #         pub fn send(&mut self, buf: &[u8], link_local: bool) -> statime::time::Time { unimplemented!() }
 /// #     }
 /// # }
 /// struct MyPortResources {
@@ -178,12 +184,12 @@ pub(crate) mod state;
 /// fn handle_actions(resources: &mut MyPortResources, actions: PortActionIterator) {
 ///     for action in actions {
 ///         match action {
-///             PortAction::SendEvent { context, data } => {
-///                 let timestamp = resources.time_critical_socket.send(data);
+///             PortAction::SendEvent { context, data, link_local } => {
+///                 let timestamp = resources.time_critical_socket.send(data, link_local);
 ///                 resources.send_timestamp = Some((context, timestamp));
 ///             }
-///             PortAction::SendGeneral { data } => {
-///                 resources.general_socket.send(data);
+///             PortAction::SendGeneral { data, link_local } => {
+///                 resources.general_socket.send(data, link_local);
 ///             }
 ///             PortAction::ResetAnnounceTimer { duration } => {
 ///                 resources.announce_timer.expire_in(duration)
@@ -198,6 +204,7 @@ pub(crate) mod state;
 ///             PortAction::ResetFilterUpdateTimer { duration } => {
 ///                 resources.filter_update_timer.expire_in(duration)
 ///             }
+///             PortAction::ForwardTLV { .. } => {}
 ///         }
 ///     }
 /// }
@@ -234,11 +241,11 @@ pub(crate) mod state;
 /// use statime::Clock;
 /// use statime::config::AcceptableMasterList;
 /// use statime::filters::Filter;
-/// use statime::port::{Port, PortActionIterator, Running};
+/// use statime::port::{NoForwardedTLVs, Port, PortActionIterator, Running};
 ///
 /// fn something_happend(resources: &mut MyPortResources, running_port: &mut Port<Running, impl AcceptableMasterList, impl Rng, impl Clock, impl Filter>) {
 ///     let actions = if resources.announce_timer.has_expired() {
-///         running_port.handle_announce_timer()
+///         running_port.handle_announce_timer(&mut NoForwardedTLVs)
 ///     } else if resources.sync_timer.has_expired() {
 ///         running_port.handle_sync_timer()
 ///     } else if resources.delay_req_timer.has_expired() {
@@ -262,133 +269,68 @@ pub(crate) mod state;
 /// }
 /// ```
 #[derive(Debug)]
-pub struct Port<L, A, R, C, F: Filter> {
+pub struct Port<'a, L, A, R, C, F: Filter, S = RefCell<PtpInstanceState>> {
     config: PortConfig<()>,
     filter_config: F::Config,
     clock: C,
     // PortDS port_identity
     pub(crate) port_identity: PortIdentity,
     // Corresponds with PortDS port_state and enabled
-    port_state: PortState<F>,
+    port_state: PortState,
+    instance_state: &'a S,
     bmca: Bmca<A>,
     packet_buffer: [u8; MAX_DATA_LEN],
     lifecycle: L,
     rng: R,
+    // Age of the last announce message that triggered
+    // multiport disable. Once this gets larger than the
+    // port announce interval, we can once again become
+    // master.
+    multiport_disable: Option<Duration>,
+
+    announce_seq_ids: SequenceIdGenerator,
+    sync_seq_ids: SequenceIdGenerator,
+    delay_seq_ids: SequenceIdGenerator,
+    pdelay_seq_ids: SequenceIdGenerator,
+
+    filter: F,
+    /// Mean delay means either `mean_path_delay` when DelayMechanism is E2E,
+    /// or `mean_link_delay` when DelayMechanism is P2P.
+    mean_delay: Option<Duration>,
+    peer_delay_state: PeerDelayState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerDelayState {
+    Empty,
+    Measuring {
+        id: u16,
+        responder_identity: Option<PortIdentity>,
+        request_send_time: Option<Time>,
+        request_recv_time: Option<Time>,
+        response_send_time: Option<Time>,
+        response_recv_time: Option<Time>,
+    },
+    PostMeasurement {
+        id: u16,
+        responder_identity: PortIdentity,
+    },
 }
 
 /// Type state of [`Port`] entered by [`Port::end_bmca`]
 #[derive(Debug)]
-pub struct Running<'a> {
-    state_refcell: &'a AtomicRefCell<PtpInstanceState>,
-    state: AtomicRef<'a, PtpInstanceState>,
-}
+pub struct Running;
 
 /// Type state of [`Port`] entered by [`Port::start_bmca`]
 #[derive(Debug)]
-pub struct InBmca<'a> {
+pub struct InBmca {
     pending_action: PortActionIterator<'static>,
     local_best: Option<BestAnnounceMessage>,
-    state_refcell: &'a AtomicRefCell<PtpInstanceState>,
 }
 
-/// Identification of a packet that should be sent out.
-///
-/// The caller receives this from a [`PortAction::SendEvent`] and should return
-/// it to the [`Port`] with [`Port::handle_send_timestamp`] once the transmit
-/// timestamp of that packet is known.
-///
-/// This type is non-copy and non-clone on purpose to ensures a single
-/// [`handle_send_timestamp`](`Port::handle_send_timestamp`) per
-/// [`SendEvent`](`PortAction::SendEvent`).
-#[derive(Debug)]
-pub struct TimestampContext {
-    inner: TimestampContextInner,
-}
-
-#[derive(Debug)]
-enum TimestampContextInner {
-    Sync { id: u16 },
-    DelayReq { id: u16 },
-}
-
-/// An action the [`Port`] needs the user to perform
-#[derive(Debug)]
-#[must_use]
-#[allow(missing_docs)] // Explaining the fields as well as the variants does not add value
-pub enum PortAction<'a> {
-    /// Send a time-critical packet
-    ///
-    /// Once the packet is sent and the transmit timestamp known the user should
-    /// return the given [`TimestampContext`] using
-    /// [`Port::handle_send_timestamp`].
-    SendEvent {
-        context: TimestampContext,
-        data: &'a [u8],
-    },
-    /// Send a general packet
-    ///
-    /// For a packet sent this way no timestamp needs to be captured.
-    SendGeneral { data: &'a [u8] },
-    /// Call [`Port::handle_announce_timer`] in `duration` from now
-    ResetAnnounceTimer { duration: core::time::Duration },
-    /// Call [`Port::handle_sync_timer`] in `duration` from now
-    ResetSyncTimer { duration: core::time::Duration },
-    /// Call [`Port::handle_delay_request_timer`] in `duration` from now
-    ResetDelayRequestTimer { duration: core::time::Duration },
-    /// Call [`Port::handle_announce_receipt_timer`] in `duration` from now
-    ResetAnnounceReceiptTimer { duration: core::time::Duration },
-    /// Call [`Port::handle_filter_update_timer`] in `duration` from now
-    ResetFilterUpdateTimer { duration: core::time::Duration },
-}
-
-const MAX_ACTIONS: usize = 2;
-
-/// An Iterator over [`PortAction`]s
-///
-/// These are returned by [`Port`] when ever the library needs the user to
-/// perform actions to the system.
-///
-/// **Guarantees to end user:** Any set of actions will only ever contain a
-/// single event send
-#[derive(Debug)]
-#[must_use]
-pub struct PortActionIterator<'a> {
-    internal: <ArrayVec<PortAction<'a>, MAX_ACTIONS> as IntoIterator>::IntoIter,
-}
-
-impl<'a> PortActionIterator<'a> {
-    /// Get an empty Iterator
-    ///
-    /// This can for example be used to have a default value in chained `if`
-    /// statements.
-    pub fn empty() -> Self {
-        Self {
-            internal: ArrayVec::new().into_iter(),
-        }
-    }
-    fn from(list: ArrayVec<PortAction<'a>, MAX_ACTIONS>) -> Self {
-        Self {
-            internal: list.into_iter(),
-        }
-    }
-    fn from_filter(update: FilterUpdate) -> Self {
-        if let Some(duration) = update.next_update {
-            actions![PortAction::ResetFilterUpdateTimer { duration }]
-        } else {
-            actions![]
-        }
-    }
-}
-
-impl<'a> Iterator for PortActionIterator<'a> {
-    type Item = PortAction<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.internal.next()
-    }
-}
-
-impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running<'a>, A, R, C, F> {
+impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex>
+    Port<'a, Running, A, R, C, F, S>
+{
     /// Inform the port about a transmit timestamp being available
     ///
     /// `context` is the handle of the packet that was send from the
@@ -398,48 +340,39 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running<'a>,
         context: TimestampContext,
         timestamp: Time,
     ) -> PortActionIterator<'_> {
-        let actions = self.port_state.handle_timestamp(
-            self.config.delay_asymmetry,
-            context,
-            timestamp,
-            self.port_identity,
-            &self.lifecycle.state.default_ds,
-            &mut self.clock,
-            &mut self.packet_buffer,
-        );
-
-        actions
+        match context.inner {
+            actions::TimestampContextInner::Sync { id } => {
+                self.handle_sync_timestamp(id, timestamp)
+            }
+            actions::TimestampContextInner::DelayReq { id } => {
+                self.handle_delay_timestamp(id, timestamp)
+            }
+            actions::TimestampContextInner::PDelayReq { id } => {
+                self.handle_pdelay_timestamp(id, timestamp)
+            }
+            actions::TimestampContextInner::PDelayResp {
+                id,
+                requestor_identity,
+            } => self.handle_pdelay_response_timestamp(id, requestor_identity, timestamp),
+        }
     }
 
     /// Handle the announce timer going off
-    pub fn handle_announce_timer(&mut self) -> PortActionIterator<'_> {
-        self.port_state.send_announce(
-            self.lifecycle.state.deref(),
-            &self.config,
-            self.port_identity,
-            &mut self.packet_buffer,
-        )
+    pub fn handle_announce_timer(
+        &mut self,
+        tlv_provider: &mut impl ForwardedTLVProvider,
+    ) -> PortActionIterator<'_> {
+        self.send_announce(tlv_provider)
     }
 
     /// Handle the sync timer going off
     pub fn handle_sync_timer(&mut self) -> PortActionIterator<'_> {
-        self.port_state.send_sync(
-            &self.config,
-            self.port_identity,
-            &self.lifecycle.state.default_ds,
-            &mut self.packet_buffer,
-        )
+        self.send_sync()
     }
 
     /// Handle the delay request timer going off
     pub fn handle_delay_request_timer(&mut self) -> PortActionIterator<'_> {
-        self.port_state.send_delay_request(
-            &mut self.rng,
-            &self.config,
-            self.port_identity,
-            &self.lifecycle.state.default_ds,
-            &mut self.packet_buffer,
-        )
+        self.send_delay_request()
     }
 
     /// Handle the announce receipt timer going off
@@ -447,8 +380,8 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running<'a>,
         // we didn't hear announce messages from other masters, so become master
         // ourselves
         match self.port_state {
-            PortState::Master(_) => (),
-            _ => self.set_forced_port_state(PortState::Master(MasterState::new())),
+            PortState::Master => (),
+            _ => self.set_forced_port_state(PortState::Master),
         }
 
         // Immediately start sending syncs and announces
@@ -464,131 +397,161 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<Running<'a>,
 
     /// Handle the filter update timer going off
     pub fn handle_filter_update_timer(&mut self) -> PortActionIterator {
-        self.port_state.handle_filter_update(&mut self.clock)
+        let update = self.filter.update(&mut self.clock);
+        if update.mean_delay.is_some() {
+            self.mean_delay = update.mean_delay;
+        }
+        PortActionIterator::from_filter(update)
     }
 
     /// Set this [`Port`] into [`InBmca`] mode to use it with
     /// [`PtpInstance::bmca`].
-    pub fn start_bmca(self) -> Port<InBmca<'a>, A, R, C, F> {
+    pub fn start_bmca(self) -> Port<'a, InBmca, A, R, C, F, S> {
         Port {
             port_state: self.port_state,
+            instance_state: self.instance_state,
             config: self.config,
             filter_config: self.filter_config,
             clock: self.clock,
             port_identity: self.port_identity,
             bmca: self.bmca,
             rng: self.rng,
+            multiport_disable: self.multiport_disable,
             packet_buffer: [0; MAX_DATA_LEN],
             lifecycle: InBmca {
                 pending_action: actions![],
                 local_best: None,
-                state_refcell: self.lifecycle.state_refcell,
             },
+            announce_seq_ids: self.announce_seq_ids,
+            sync_seq_ids: self.sync_seq_ids,
+            delay_seq_ids: self.delay_seq_ids,
+            pdelay_seq_ids: self.pdelay_seq_ids,
+
+            filter: self.filter,
+            mean_delay: self.mean_delay,
+            peer_delay_state: self.peer_delay_state,
         }
     }
 
-    /// Handle a message over the event channel
-    pub fn handle_event_receive(&mut self, data: &[u8], timestamp: Time) -> PortActionIterator {
+    // parse and do basic domain filtering on message
+    fn parse_and_filter<'b>(
+        &mut self,
+        data: &'b [u8],
+    ) -> ControlFlow<PortActionIterator<'b>, Message<'b>> {
+        if !is_message_buffer_compatible(data) {
+            // do not spam with parse error in mixed-version PTPv1+v2 networks
+            return ControlFlow::Break(actions![]);
+        }
         let message = match Message::deserialize(data) {
             Ok(message) => message,
             Err(error) => {
                 log::warn!("Could not parse packet: {:?}", error);
-                return actions![];
+                return ControlFlow::Break(actions![]);
             }
         };
-
-        // Only process messages from the same domain
-        if message.header().sdo_id != self.lifecycle.state.default_ds.sdo_id
-            || message.header().domain_number != self.lifecycle.state.default_ds.domain_number
-        {
-            return actions![];
+        let domain_matches = self.instance_state.with_ref(|state| {
+            message.header().sdo_id == state.default_ds.sdo_id
+                && message.header().domain_number == state.default_ds.domain_number
+        });
+        if !domain_matches {
+            return ControlFlow::Break(actions![]);
         }
+        ControlFlow::Continue(message)
+    }
 
-        if message.is_event() {
-            self.port_state.handle_event_receive(
-                self.config.delay_asymmetry,
-                message,
-                timestamp,
-                self.config.min_delay_req_interval(),
-                self.port_identity,
-                &mut self.clock,
-                &mut self.packet_buffer,
-            )
-        } else {
-            self.handle_general_internal(message)
+    /// Handle a message over the event channel
+    pub fn handle_event_receive<'b>(
+        &'b mut self,
+        data: &'b [u8],
+        timestamp: Time,
+    ) -> PortActionIterator<'b> {
+        let message = match self.parse_and_filter(data) {
+            ControlFlow::Continue(value) => value,
+            ControlFlow::Break(value) => return value,
+        };
+
+        match message.body {
+            MessageBody::Sync(sync) => self.handle_sync(message.header, sync, timestamp),
+            MessageBody::DelayReq(delay_request) => {
+                self.handle_delay_req(message.header, delay_request, timestamp)
+            }
+            MessageBody::PDelayReq(_) => self.handle_pdelay_req(message.header, timestamp),
+            MessageBody::PDelayResp(peer_delay_response) => {
+                self.handle_peer_delay_response(message.header, peer_delay_response, timestamp)
+            }
+            _ => self.handle_general_internal(message),
         }
     }
 
     /// Handle a general ptp message
-    pub fn handle_general_receive(&mut self, data: &[u8]) -> PortActionIterator {
-        let message = match Message::deserialize(data) {
-            Ok(message) => message,
-            Err(error) => {
-                log::warn!("Could not parse packet: {:?}", error);
-                return actions![];
-            }
+    pub fn handle_general_receive<'b>(&'b mut self, data: &'b [u8]) -> PortActionIterator<'b> {
+        let message = match self.parse_and_filter(data) {
+            ControlFlow::Continue(value) => value,
+            ControlFlow::Break(value) => return value,
         };
-
-        // Only process messages from the same domain
-        if message.header().sdo_id != self.lifecycle.state.default_ds.sdo_id
-            || message.header().domain_number != self.lifecycle.state.default_ds.domain_number
-        {
-            return actions![];
-        }
 
         self.handle_general_internal(message)
     }
 
-    fn handle_general_internal(&mut self, message: Message<'_>) -> PortActionIterator<'_> {
+    fn handle_general_internal<'b>(&'b mut self, message: Message<'b>) -> PortActionIterator<'b> {
         match message.body {
-            MessageBody::Announce(announce) => {
-                if self
-                    .bmca
-                    .register_announce_message(&message.header, &announce)
-                {
-                    actions![PortAction::ResetAnnounceReceiptTimer {
-                        duration: self.config.announce_duration(&mut self.rng),
-                    }]
-                } else {
-                    actions![]
-                }
+            MessageBody::Announce(announce) => self.handle_announce(&message, announce),
+            MessageBody::FollowUp(follow_up) => self.handle_follow_up(message.header, follow_up),
+            MessageBody::DelayResp(delay_response) => {
+                self.handle_delay_resp(message.header, delay_response)
             }
-            _ => self.port_state.handle_general_receive(
-                self.config.delay_asymmetry,
-                message,
-                self.port_identity,
-                &mut self.clock,
-            ),
+            MessageBody::PDelayRespFollowUp(peer_delay_follow_up) => {
+                self.handle_peer_delay_response_follow_up(message.header, peer_delay_follow_up)
+            }
+            MessageBody::Sync(_)
+            | MessageBody::DelayReq(_)
+            | MessageBody::PDelayReq(_)
+            | MessageBody::PDelayResp(_) => {
+                log::warn!("Received event message over general interface");
+                actions![]
+            }
+            MessageBody::Management(_) | MessageBody::Signaling(_) => actions![],
         }
     }
 }
 
-impl<'a, A, C, F: Filter, R> Port<InBmca<'a>, A, R, C, F> {
+impl<'a, A, C, F: Filter, R, S> Port<'a, InBmca, A, R, C, F, S> {
     /// End a BMCA cycle and make the
     /// [`handle_*`](`Port::handle_send_timestamp`) methods available again
-    pub fn end_bmca(self) -> (Port<Running<'a>, A, R, C, F>, PortActionIterator<'static>) {
+    pub fn end_bmca(
+        self,
+    ) -> (
+        Port<'a, Running, A, R, C, F, S>,
+        PortActionIterator<'static>,
+    ) {
         (
             Port {
                 port_state: self.port_state,
+                instance_state: self.instance_state,
                 config: self.config,
                 filter_config: self.filter_config,
                 clock: self.clock,
                 port_identity: self.port_identity,
                 bmca: self.bmca,
                 rng: self.rng,
+                multiport_disable: self.multiport_disable,
                 packet_buffer: [0; MAX_DATA_LEN],
-                lifecycle: Running {
-                    state_refcell: self.lifecycle.state_refcell,
-                    state: self.lifecycle.state_refcell.borrow(),
-                },
+                lifecycle: Running,
+                announce_seq_ids: self.announce_seq_ids,
+                sync_seq_ids: self.sync_seq_ids,
+                delay_seq_ids: self.delay_seq_ids,
+                pdelay_seq_ids: self.pdelay_seq_ids,
+                filter: self.filter,
+                mean_delay: self.mean_delay,
+                peer_delay_state: self.peer_delay_state,
             },
             self.lifecycle.pending_action,
         )
     }
 }
 
-impl<L, A, R, C: Clock, F: Filter> Port<L, A, R, C, F> {
-    fn set_forced_port_state(&mut self, mut state: PortState<F>) {
+impl<L, A, R, C: Clock, F: Filter, S> Port<'_, L, A, R, C, F, S> {
+    fn set_forced_port_state(&mut self, mut state: PortState) {
         log::info!(
             "new state for port {}: {} -> {}",
             self.port_identity.port_number,
@@ -596,17 +559,28 @@ impl<L, A, R, C: Clock, F: Filter> Port<L, A, R, C, F> {
             state
         );
         core::mem::swap(&mut self.port_state, &mut state);
-        state.demobilize_filter(&mut self.clock);
+        if matches!(state, PortState::Slave(_) | PortState::Faulty)
+            || matches!(self.port_state, PortState::Faulty)
+        {
+            let mut filter = F::new(self.filter_config.clone());
+            core::mem::swap(&mut filter, &mut self.filter);
+            filter.demobilize(&mut self.clock);
+        }
     }
 }
 
-impl<L, A, R, C, F: Filter> Port<L, A, R, C, F> {
+impl<L, A, R, C, F: Filter, S> Port<'_, L, A, R, C, F, S> {
     /// Indicate whether this [`Port`] is steering its clock.
     pub fn is_steering(&self) -> bool {
         matches!(self.port_state, PortState::Slave(_))
     }
 
-    pub(crate) fn state(&self) -> &PortState<F> {
+    /// Indicate whether this [`Port`] is in the master state.
+    pub fn is_master(&self) -> bool {
+        matches!(self.port_state, PortState::Master)
+    }
+
+    pub(crate) fn state(&self) -> &PortState {
         &self.port_state
     }
 
@@ -615,181 +589,10 @@ impl<L, A, R, C, F: Filter> Port<L, A, R, C, F> {
     }
 }
 
-impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng> Port<InBmca<'a>, A, R, C, F> {
-    pub(crate) fn calculate_best_local_announce_message(&mut self) {
-        self.lifecycle.local_best = self.bmca.take_best_port_announce_message()
-    }
-}
-
-impl<'a, A, C: Clock, F: Filter, R: Rng> Port<InBmca<'a>, A, R, C, F> {
-    pub(crate) fn step_announce_age(&mut self, step: Duration) {
-        self.bmca.step_age(step);
-    }
-
-    pub(crate) fn best_local_announce_message_for_bmca(&self) -> Option<BestAnnounceMessage> {
-        // Announce messages received on a masterOnly PTP Port shall not be considered
-        // in the global operation of the best master clock algorithm or in the update
-        // of data sets. We still need them during the calculation of the recommended
-        // port state though to avoid getting multiple masters in the segment.
-        if self.config.master_only {
-            None
-        } else {
-            self.lifecycle.local_best
-        }
-    }
-
-    pub(crate) fn best_local_announce_message_for_state(&self) -> Option<BestAnnounceMessage> {
-        // Announce messages received on a masterOnly PTP Port shall not be considered
-        // in the global operation of the best master clock algorithm or in the update
-        // of data sets. We still need them during the calculation of the recommended
-        // port state though to avoid getting multiple masters in the segment.
-        self.lifecycle.local_best
-    }
-
-    pub(crate) fn set_recommended_state(
-        &mut self,
-        recommended_state: RecommendedState,
-        time_properties_ds: &mut TimePropertiesDS,
-        current_ds: &mut CurrentDS,
-        parent_ds: &mut ParentDS,
-        default_ds: &DefaultDS,
-    ) {
-        self.set_recommended_port_state(&recommended_state, default_ds);
-
-        match recommended_state {
-            RecommendedState::M1(defaultds) | RecommendedState::M2(defaultds) => {
-                // a slave-only PTP port should never end up in the master state
-                debug_assert!(!default_ds.slave_only);
-
-                current_ds.steps_removed = 0;
-                current_ds.offset_from_master = Duration::ZERO;
-                current_ds.mean_delay = Duration::ZERO;
-
-                parent_ds.parent_port_identity.clock_identity = defaultds.clock_identity;
-                parent_ds.parent_port_identity.port_number = 0;
-                parent_ds.grandmaster_identity = defaultds.clock_identity;
-                parent_ds.grandmaster_clock_quality = defaultds.clock_quality;
-                parent_ds.grandmaster_priority_1 = defaultds.priority_1;
-                parent_ds.grandmaster_priority_2 = defaultds.priority_2;
-
-                time_properties_ds.leap_indicator = LeapIndicator::NoLeap;
-                time_properties_ds.current_utc_offset = None;
-                time_properties_ds.ptp_timescale = true;
-                time_properties_ds.time_traceable = false;
-                time_properties_ds.frequency_traceable = false;
-                time_properties_ds.time_source = TimeSource::InternalOscillator;
-            }
-            RecommendedState::M3(_) | RecommendedState::P1(_) | RecommendedState::P2(_) => {}
-            RecommendedState::S1(announce_message) => {
-                // a master-only PTP port should never end up in the slave state
-                debug_assert!(!self.config.master_only);
-
-                current_ds.steps_removed = announce_message.steps_removed + 1;
-
-                parent_ds.parent_port_identity = announce_message.header.source_port_identity;
-                parent_ds.grandmaster_identity = announce_message.grandmaster_identity;
-                parent_ds.grandmaster_clock_quality = announce_message.grandmaster_clock_quality;
-                parent_ds.grandmaster_priority_1 = announce_message.grandmaster_priority_1;
-                parent_ds.grandmaster_priority_2 = announce_message.grandmaster_priority_2;
-
-                *time_properties_ds = announce_message.time_properties();
-
-                if let Err(error) = self.clock.set_properties(time_properties_ds) {
-                    log::error!("Could not update clock: {:?}", error);
-                }
-            }
-        }
-
-        // TODO: Discuss if we should change the clock's own time properties, or keep
-        // the master's time properties separately
-        if let RecommendedState::S1(announce_message) = &recommended_state {
-            // Update time properties
-            *time_properties_ds = announce_message.time_properties();
-        }
-    }
-
-    fn set_recommended_port_state(
-        &mut self,
-        recommended_state: &RecommendedState,
-        default_ds: &DefaultDS,
-    ) {
-        match recommended_state {
-            // TODO set things like steps_removed once they are added
-            // TODO make sure states are complete
-            RecommendedState::S1(announce_message) => {
-                // a master-only PTP port should never end up in the slave state
-                debug_assert!(!self.config.master_only);
-
-                let remote_master = announce_message.header.source_port_identity;
-
-                let update_state = match &self.port_state {
-                    PortState::Listening | PortState::Master(_) | PortState::Passive => true,
-                    PortState::Slave(old_state) => old_state.remote_master() != remote_master,
-                };
-
-                if update_state {
-                    let state = PortState::Slave(SlaveState::new(
-                        remote_master,
-                        self.filter_config.clone(),
-                    ));
-                    self.set_forced_port_state(state);
-
-                    let duration = self.config.announce_duration(&mut self.rng);
-                    let reset_announce = PortAction::ResetAnnounceReceiptTimer { duration };
-                    let reset_delay = PortAction::ResetDelayRequestTimer {
-                        duration: core::time::Duration::ZERO,
-                    };
-                    self.lifecycle.pending_action = actions![reset_announce, reset_delay];
-                }
-            }
-            RecommendedState::M1(_) | RecommendedState::M2(_) | RecommendedState::M3(_) => {
-                if default_ds.slave_only {
-                    match self.port_state {
-                        PortState::Listening => { /* do nothing */ }
-                        PortState::Slave(_) | PortState::Passive => {
-                            self.set_forced_port_state(PortState::Listening);
-
-                            // consistent with Port<InBmca>::new()
-                            let duration = self.config.announce_duration(&mut self.rng);
-                            let reset_announce = PortAction::ResetAnnounceReceiptTimer { duration };
-                            self.lifecycle.pending_action = actions![reset_announce];
-                        }
-                        PortState::Master(_) => {
-                            let msg = "slave-only PTP port should not be in master state";
-                            debug_assert!(!default_ds.slave_only, "{msg}");
-                            log::error!("{msg}");
-                        }
-                    }
-                } else {
-                    match self.port_state {
-                        PortState::Listening | PortState::Slave(_) | PortState::Passive => {
-                            self.set_forced_port_state(PortState::Master(MasterState::new()));
-
-                            // Immediately start sending announces and syncs
-                            let duration = core::time::Duration::from_secs(0);
-                            self.lifecycle.pending_action = actions![
-                                PortAction::ResetAnnounceTimer { duration },
-                                PortAction::ResetSyncTimer { duration }
-                            ];
-                        }
-                        PortState::Master(_) => { /* do nothing */ }
-                    }
-                }
-            }
-            RecommendedState::P1(_) | RecommendedState::P2(_) => match self.port_state {
-                PortState::Listening | PortState::Slave(_) | PortState::Master(_) => {
-                    self.set_forced_port_state(PortState::Passive)
-                }
-                PortState::Passive => {}
-            },
-        }
-    }
-}
-
-impl<'a, A, C, F: Filter, R: Rng> Port<InBmca<'a>, A, R, C, F> {
+impl<'a, A, C, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'a, InBmca, A, R, C, F, S> {
     /// Create a new port from a port dataset on a given interface.
     pub(crate) fn new(
-        state_refcell: &'a AtomicRefCell<PtpInstanceState>,
+        instance_state: &'a S,
         config: PortConfig<A>,
         filter_config: F::Config,
         clock: C,
@@ -802,6 +605,8 @@ impl<'a, A, C, F: Filter, R: Rng> Port<InBmca<'a>, A, R, C, F> {
             config.announce_interval.as_duration().into(),
             port_identity,
         );
+
+        let filter = F::new(filter_config.clone());
 
         Port {
             config: PortConfig {
@@ -817,30 +622,41 @@ impl<'a, A, C, F: Filter, R: Rng> Port<InBmca<'a>, A, R, C, F> {
             clock,
             port_identity,
             port_state: PortState::Listening,
+            instance_state,
             bmca,
             rng,
+            multiport_disable: None,
             packet_buffer: [0; MAX_DATA_LEN],
             lifecycle: InBmca {
                 pending_action: actions![PortAction::ResetAnnounceReceiptTimer { duration }],
                 local_best: None,
-                state_refcell,
             },
+            announce_seq_ids: SequenceIdGenerator::new(),
+            sync_seq_ids: SequenceIdGenerator::new(),
+            delay_seq_ids: SequenceIdGenerator::new(),
+            pdelay_seq_ids: SequenceIdGenerator::new(),
+            filter,
+            mean_delay: None,
+            peer_delay_state: PeerDelayState::Empty,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use core::cell::RefCell;
+
     use super::*;
     use crate::{
-        bmc::acceptable_master::AcceptAnyMaster,
-        config::{DelayMechanism, InstanceConfig},
-        datastructures::messages::{AnnounceMessage, Header, PtpVersion},
+        config::{AcceptAnyMaster, DelayMechanism, InstanceConfig, TimePropertiesDS},
+        datastructures::datasets::{InternalDefaultDS, InternalParentDS, PathTraceDS},
         filters::BasicFilter,
-        time::Interval,
+        time::{Duration, Interval, Time},
+        Clock,
     };
 
-    struct TestClock;
+    // General test infra
+    pub(super) struct TestClock;
 
     impl Clock for TestClock {
         type Error = ();
@@ -865,66 +681,11 @@ mod tests {
         }
     }
 
-    fn default_announce_message_header() -> Header {
-        Header {
-            sdo_id: Default::default(),
-            version: PtpVersion::new(2, 1).unwrap(),
-            domain_number: Default::default(),
-            alternate_master_flag: false,
-            two_step_flag: false,
-            unicast_flag: false,
-            ptp_profile_specific_1: false,
-            ptp_profile_specific_2: false,
-            leap61: false,
-            leap59: false,
-            current_utc_offset_valid: false,
-            ptp_timescale: false,
-            time_tracable: false,
-            frequency_tracable: false,
-            synchronization_uncertain: false,
-            correction_field: Default::default(),
-            source_port_identity: Default::default(),
-            sequence_id: Default::default(),
-            log_message_interval: Default::default(),
-        }
-    }
-
-    fn default_announce_message() -> AnnounceMessage {
-        AnnounceMessage {
-            header: default_announce_message_header(),
-            origin_timestamp: Default::default(),
-            current_utc_offset: Default::default(),
-            grandmaster_priority_1: Default::default(),
-            grandmaster_clock_quality: Default::default(),
-            grandmaster_priority_2: Default::default(),
-            grandmaster_identity: Default::default(),
-            steps_removed: Default::default(),
-            time_source: Default::default(),
-        }
-    }
-
-    #[test]
-    fn test_announce_receive() {
-        let default_ds = DefaultDS::new(InstanceConfig {
-            clock_identity: Default::default(),
-            priority_1: 255,
-            priority_2: 255,
-            domain_number: 0,
-            slave_only: false,
-            sdo_id: Default::default(),
-        });
-
-        let parent_ds = ParentDS::new(default_ds);
-
-        let state = AtomicRefCell::new(PtpInstanceState {
-            default_ds,
-            current_ds: Default::default(),
-            parent_ds,
-            time_properties_ds: Default::default(),
-        });
-
+    pub(super) fn setup_test_port(
+        state: &RefCell<PtpInstanceState>,
+    ) -> Port<'_, Running, AcceptAnyMaster, rand::rngs::mock::StepRng, TestClock, BasicFilter> {
         let port = Port::<_, _, _, _, BasicFilter>::new(
-            &state,
+            state,
             PortConfig {
                 acceptable_master_list: AcceptAnyMaster,
                 delay_mechanism: DelayMechanism::E2E {
@@ -942,65 +703,14 @@ mod tests {
             rand::rngs::mock::StepRng::new(2, 1),
         );
 
-        let (mut port, _) = port.end_bmca();
-
-        let mut announce = default_announce_message();
-        announce.header.source_port_identity.clock_identity.0 = [1, 2, 3, 4, 5, 6, 7, 8];
-        let announce_message = Message {
-            header: announce.header,
-            body: MessageBody::Announce(announce),
-            suffix: Default::default(),
-        };
-        let mut packet = [0; MAX_DATA_LEN];
-        let packet_len = announce_message.serialize(&mut packet).unwrap();
-        let packet = &packet[..packet_len];
-
-        let mut actions = port.handle_general_receive(packet);
-        let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
-            panic!("Unexpected action");
-        };
-        assert!(actions.next().is_none());
-        drop(actions);
-
-        let mut actions = port.handle_general_receive(packet);
-        let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
-            panic!("Unexpected action");
-        };
-        assert!(actions.next().is_none());
-        drop(actions);
-
-        let mut actions = port.handle_general_receive(packet);
-        let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
-            panic!("Unexpected action");
-        };
-        assert!(actions.next().is_none());
-        drop(actions);
-
-        let mut port = port.start_bmca();
-        port.calculate_best_local_announce_message();
-        assert!(port.best_local_announce_message_for_bmca().is_some());
+        let (port, _) = port.end_bmca();
+        port
     }
 
-    #[test]
-    fn test_announce_receive_via_event() {
-        let default_ds = DefaultDS::new(InstanceConfig {
-            clock_identity: Default::default(),
-            priority_1: 255,
-            priority_2: 255,
-            domain_number: 0,
-            slave_only: false,
-            sdo_id: Default::default(),
-        });
-
-        let parent_ds = ParentDS::new(default_ds);
-
-        let state = AtomicRefCell::new(PtpInstanceState {
-            default_ds,
-            current_ds: Default::default(),
-            parent_ds,
-            time_properties_ds: Default::default(),
-        });
-
+    pub(super) fn setup_test_port_custom_identity(
+        state: &RefCell<PtpInstanceState>,
+        port_identity: PortIdentity,
+    ) -> Port<'_, Running, AcceptAnyMaster, rand::rngs::mock::StepRng, TestClock, BasicFilter> {
         let port = Port::<_, _, _, _, BasicFilter>::new(
             &state,
             PortConfig {
@@ -1016,46 +726,61 @@ mod tests {
             },
             0.25,
             TestClock,
+            port_identity,
+            rand::rngs::mock::StepRng::new(2, 1),
+        );
+
+        let (port, _) = port.end_bmca();
+        port
+    }
+
+    pub(super) fn setup_test_port_custom_filter<F: Filter>(
+        state: &RefCell<PtpInstanceState>,
+        filter_config: F::Config,
+    ) -> Port<'_, Running, AcceptAnyMaster, rand::rngs::mock::StepRng, TestClock, F> {
+        let port = Port::<_, _, _, _, F>::new(
+            state,
+            PortConfig {
+                acceptable_master_list: AcceptAnyMaster,
+                delay_mechanism: DelayMechanism::E2E {
+                    interval: Interval::from_log_2(1),
+                },
+                announce_interval: Interval::from_log_2(1),
+                announce_receipt_timeout: 3,
+                sync_interval: Interval::from_log_2(0),
+                master_only: false,
+                delay_asymmetry: Duration::ZERO,
+            },
+            filter_config,
+            TestClock,
             Default::default(),
             rand::rngs::mock::StepRng::new(2, 1),
         );
 
-        let (mut port, _) = port.end_bmca();
+        let (port, _) = port.end_bmca();
+        port
+    }
 
-        let mut announce = default_announce_message();
-        announce.header.source_port_identity.clock_identity.0 = [1, 2, 3, 4, 5, 6, 7, 8];
-        let announce_message = Message {
-            header: announce.header,
-            body: MessageBody::Announce(announce),
-            suffix: Default::default(),
-        };
-        let mut packet = [0; MAX_DATA_LEN];
-        let packet_len = announce_message.serialize(&mut packet).unwrap();
-        let packet = &packet[..packet_len];
+    pub(super) fn setup_test_state() -> RefCell<PtpInstanceState> {
+        let default_ds = InternalDefaultDS::new(InstanceConfig {
+            clock_identity: Default::default(),
+            priority_1: 255,
+            priority_2: 255,
+            domain_number: 0,
+            slave_only: false,
+            sdo_id: Default::default(),
+            path_trace: false,
+        });
 
-        let mut actions = port.handle_event_receive(packet, Time::from_micros(1));
-        let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
-            panic!("Unexpected action");
-        };
-        assert!(actions.next().is_none());
-        drop(actions);
+        let parent_ds = InternalParentDS::new(default_ds);
 
-        let mut actions = port.handle_event_receive(packet, Time::from_micros(2));
-        let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
-            panic!("Unexpected action");
-        };
-        assert!(actions.next().is_none());
-        drop(actions);
-
-        let mut actions = port.handle_event_receive(packet, Time::from_micros(3));
-        let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
-            panic!("Unexpected action");
-        };
-        assert!(actions.next().is_none());
-        drop(actions);
-
-        let mut port = port.start_bmca();
-        port.calculate_best_local_announce_message();
-        assert!(port.best_local_announce_message_for_bmca().is_some());
+        let state = RefCell::new(PtpInstanceState {
+            default_ds,
+            current_ds: Default::default(),
+            parent_ds,
+            time_properties_ds: Default::default(),
+            path_trace_ds: PathTraceDS::new(false),
+        });
+        state
     }
 }

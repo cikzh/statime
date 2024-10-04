@@ -18,7 +18,7 @@ The `statime-stm32` crate gives an example of how to use statime on an embedded 
 
 The `statime-linux` crate provides a binary for Linux implementing an ordinary or boundary clock. It will need sufficient permissions to change the system clock to use. The easiest way to start it is through sudo:
 ```
-sudo ./target/debug/statime-linux -i <network_interface>
+sudo ./target/debug/statime -c path/to/statime.toml
 ```
 
 ## Structure
@@ -37,7 +37,7 @@ cargo +nightly build
 ```
 and then run it as root with
 ```
-sudo ./target/debug/statime-linux -i <ETHERNET INTERFACE NAME>
+sudo ./target/debug/statime -i <ETHERNET INTERFACE NAME>
 ```
 
 ## PTPd setup for testing
@@ -58,9 +58,9 @@ where `<INTERFACE>` is the network interface you want ptpd to use. Here `-n` dis
 
 # Roadmap
 
-- Q2 2023: PTP master, boundary clock
-- Q3 2023: NTP/PTP clock device + development of PTP for Linux
-- Q4 2023: First release of PTP for Linux + R&D fieldtest TimeNL
+- Q2 2024: Power sector profile + experimental NTS4PTP
+- Q3 2024: Stable release Statime (pending funding)
+- Q1-Q4 2024: Adoption work & maintenance work
 
 # Support our work
 
